@@ -132,18 +132,56 @@ class CsvPipelineTest(unittest.TestCase):
         )
         np.testing.assert_array_equal(result.beat_times, beat_times)
 
+        off_result, _, off_decisions = bpm.apply_conservative_repairs(
+            result, candidates, [(0.0, 6.0)], "off"
+        )
+        np.testing.assert_array_equal(off_result.beat_times, beat_times)
+        self.assertTrue(any(item.status == "disabled" for item in off_decisions))
+
+    def test_p3b_preview_applies_only_to_repaired_interface(self) -> None:
+        beat_times = np.asarray([0.0, 0.7, 1.4, 2.8, 3.5, 4.2, 4.9, 5.6])
+        result = bpm.BeatResult("beat-this-fused", beat_times)
+        _, candidates = bpm.diagnose_fused_beats(
+            result, self.frames, [(0.0, 6.0)]
+        )
+        repaired_result, records, decisions = bpm.apply_conservative_repairs(
+            result, candidates, [(0.0, 6.0)], "preview"
+        )
+
+        np.testing.assert_array_equal(result.beat_times, beat_times)
+        self.assertIn(2.1, repaired_result.beat_times)
+        self.assertTrue(
+            any(item.status == "preview_applied" for item in decisions)
+        )
+
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "fused.csv"
             repaired = root / "repaired.csv"
-            mids, raw, smooth = bpm.local_tempo(result.beat_times)
-            bpm.write_beats_csv(
-                source, result, mids, raw, smooth, 22050, [(0.0, 6.0)]
+            decisions_path = root / "decisions.csv"
+            bpm.write_repaired_beats_csv(
+                repaired,
+                repaired_result,
+                records,
+                22050,
+                [(0.0, 6.0)],
             )
-            bpm.write_diagnostic_repaired_beats_csv(source, repaired)
+            bpm.write_repair_decisions_csv(decisions_path, decisions)
             loaded = bpm.read_beats_csv(repaired, "beat-this-repaired")
+            loaded_decisions = bpm.read_repair_decisions_csv(decisions_path)
 
-        np.testing.assert_array_equal(loaded.beat_times, beat_times)
+        np.testing.assert_array_equal(loaded.beat_times, repaired_result.beat_times)
+        self.assertEqual(len(loaded_decisions), len(decisions))
+
+        repeated_result, _, repeated_decisions = bpm.apply_conservative_repairs(
+            result, candidates, [(0.0, 6.0)], "preview"
+        )
+        np.testing.assert_array_equal(
+            repeated_result.beat_times, repaired_result.beat_times
+        )
+        self.assertEqual(
+            [item.status for item in repeated_decisions],
+            [item.status for item in decisions],
+        )
 
     def test_p3a_detects_extra_beat_and_protects_smooth_motion(self) -> None:
         extra_times = np.asarray([0.0, 0.7, 1.05, 1.4, 2.1, 2.8, 3.5, 4.2])
@@ -154,6 +192,20 @@ class CsvPipelineTest(unittest.TestCase):
         )
         self.assertTrue(
             any(item.candidate_type == "extra_beat" for item in extra_candidates)
+        )
+        extra_repaired, _, extra_decisions = bpm.apply_conservative_repairs(
+            bpm.BeatResult("beat-this-fused", extra_times),
+            extra_candidates,
+            [(0.0, 5.0)],
+            "preview",
+        )
+        self.assertNotIn(1.05, extra_repaired.beat_times)
+        self.assertTrue(
+            any(
+                item.candidate_type == "extra_beat"
+                and item.status == "preview_applied"
+                for item in extra_decisions
+            )
         )
 
         periods = np.asarray([0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.70])
@@ -168,6 +220,16 @@ class CsvPipelineTest(unittest.TestCase):
         )
         self.assertTrue(
             any(item.candidate_type == "tempo_motion" for item in motion_candidates)
+        )
+        motion_repaired, _, motion_decisions = bpm.apply_conservative_repairs(
+            bpm.BeatResult("beat-this-fused", motion_times),
+            motion_candidates,
+            [(0.0, 5.0)],
+            "preview",
+        )
+        np.testing.assert_array_equal(motion_repaired.beat_times, motion_times)
+        self.assertFalse(
+            any(item.status == "preview_applied" for item in motion_decisions)
         )
 
 

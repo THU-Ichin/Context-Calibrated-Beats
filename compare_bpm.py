@@ -8,9 +8,9 @@ For every input file, this script writes the official raw and overlap-fused:
   * tempo and probability comparison plots;
   * a CSV summary and a JSON report of possible tempo-change regions.
 
-P3-A also writes interval diagnostics, repair candidates, and an unchanged
-"repaired" beat interface. These outputs are observational only: grid
-normalisation still consumes the saved overlap-fused beats.
+P3-A writes interval diagnostics and broad repair candidates. P3-B adjudicates
+those candidates into a traceable repaired-beat proposal. Preview mode keeps
+the proposal out of grid normalisation; conservative mode uses its saved CSV.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -162,6 +162,35 @@ class RepairCandidate:
     protected_reason: str
     proposed_times: str
     diagnostic_note: str
+
+
+@dataclass
+class BeatRepairRecord:
+    time_seconds: float
+    original_beat_index: int | None
+    original_time_seconds: float | None
+    repair_action: str
+    repair_candidate_id: int | None
+    repair_confidence: float
+    repair_source: str
+    repair_note: str
+    is_downbeat: bool = False
+
+
+@dataclass
+class RepairDecision:
+    candidate_id: int
+    candidate_type: str
+    status: str
+    reason: str
+    start_seconds: float
+    end_seconds: float
+    candidate_confidence: float
+    local_cost_before: float | None
+    local_cost_after: float | None
+    cost_improvement: float | None
+    affected_original_indices: str
+    resulting_times: str
 
 
 class BeatThisEstimator:
@@ -682,6 +711,324 @@ def diagnose_fused_beats(
                     diagnostic_note="Do not treat this smooth period motion as a spike",
                 )
     return diagnostics, candidates
+
+
+def _repair_local_cost(
+    records: list[BeatRepairRecord],
+    start_seconds: float,
+    end_seconds: float,
+    reference_interval: float,
+    segment_bounds: tuple[float, float],
+) -> tuple[float, float]:
+    if reference_interval <= 1e-9:
+        return math.inf, math.inf
+    margin = 2.0 * reference_interval
+    times = np.asarray(
+        sorted(
+            item.time_seconds
+            for item in records
+            if max(segment_bounds[0], start_seconds - margin)
+            <= item.time_seconds
+            <= min(segment_bounds[1], end_seconds + margin)
+        ),
+        dtype=float,
+    )
+    if len(times) < 2:
+        return math.inf, math.inf
+    errors = np.abs(np.diff(times) / reference_interval - 1.0)
+    maximum = float(np.max(errors))
+    return float(np.mean(errors) + 0.5 * maximum), maximum
+
+
+def apply_conservative_repairs(
+    fused_result: BeatResult,
+    candidates: list[RepairCandidate],
+    ranges: list[tuple[float, float]],
+    mode: str,
+) -> tuple[BeatResult, list[BeatRepairRecord], list[RepairDecision]]:
+    """Adjudicate P3-A candidates; preview and conservative share decisions."""
+    downbeats = np.asarray(
+        fused_result.downbeat_times
+        if fused_result.downbeat_times is not None
+        else [],
+        dtype=float,
+    )
+    records = [
+        BeatRepairRecord(
+            time_seconds=float(time_seconds),
+            original_beat_index=index + 1,
+            original_time_seconds=float(time_seconds),
+            repair_action="keep",
+            repair_candidate_id=None,
+            repair_confidence=1.0,
+            repair_source="beat-this-fused",
+            repair_note="",
+            is_downbeat=bool(
+                len(downbeats)
+                and np.min(np.abs(downbeats - time_seconds)) <= 0.05
+            ),
+        )
+        for index, time_seconds in enumerate(fused_result.beat_times)
+    ]
+    decisions: list[RepairDecision] = []
+    protected_ranges = [
+        (item.start_seconds, item.end_seconds)
+        for item in candidates
+        if item.candidate_type == "tempo_motion"
+    ]
+    occupied_ranges: list[tuple[float, float]] = []
+
+    def overlaps(
+        start: float, end: float, ranges_to_check: list[tuple[float, float]]
+    ) -> bool:
+        return any(start < right and end > left for left, right in ranges_to_check)
+
+    def add_decision(
+        candidate: RepairCandidate,
+        status: str,
+        reason: str,
+        before: float | None = None,
+        after: float | None = None,
+        affected: str = "",
+        resulting: str = "",
+    ) -> None:
+        improvement = None
+        if before is not None and after is not None and before > 1e-9:
+            improvement = (before - after) / before
+        decisions.append(
+            RepairDecision(
+                candidate_id=candidate.candidate_id,
+                candidate_type=candidate.candidate_type,
+                status=status,
+                reason=reason,
+                start_seconds=candidate.start_seconds,
+                end_seconds=candidate.end_seconds,
+                candidate_confidence=candidate.candidate_confidence,
+                local_cost_before=before,
+                local_cost_after=after,
+                cost_improvement=improvement,
+                affected_original_indices=affected,
+                resulting_times=resulting,
+            )
+        )
+
+    for candidate in candidates:
+        if candidate.candidate_type == "tempo_motion":
+            add_decision(candidate, "protected", candidate.protected_reason)
+
+    priority = {"phase_prefix": 0, "missing_beat": 1, "extra_beat": 2}
+    actionable = sorted(
+        (item for item in candidates if item.candidate_type in priority),
+        key=lambda item: (priority[item.candidate_type], item.start_seconds),
+    )
+    for candidate in actionable:
+        reference = candidate.reference_interval_seconds
+        if mode == "off":
+            add_decision(candidate, "disabled", "repair_mode_off")
+            continue
+        if reference is None or reference <= 1e-9:
+            add_decision(candidate, "rejected", "missing_reference_interval")
+            continue
+        if not 0 <= candidate.activity_segment_id < len(ranges):
+            add_decision(candidate, "rejected", "invalid_activity_segment")
+            continue
+        segment_bounds = ranges[candidate.activity_segment_id]
+        if overlaps(candidate.start_seconds, candidate.end_seconds, protected_ranges):
+            add_decision(candidate, "rejected", "overlaps_protected_tempo_motion")
+            continue
+        if overlaps(candidate.start_seconds, candidate.end_seconds, occupied_ranges):
+            add_decision(candidate, "rejected", "conflicts_with_higher_priority_repair")
+            continue
+
+        gate_reason = ""
+        if candidate.candidate_type == "phase_prefix":
+            residual_ratio = candidate.relative_deviation or 0.0
+            if candidate.candidate_confidence < 0.85:
+                gate_reason = "phase_confidence_below_0.85"
+            elif (candidate.future_stability or 0.0) < 0.75:
+                gate_reason = "future_stability_below_0.75"
+            elif not 0.12 <= residual_ratio <= 0.35:
+                gate_reason = "phase_residual_outside_12_to_35_percent"
+        elif candidate.candidate_type == "missing_beat":
+            proposed_count = len(
+                [item for item in candidate.proposed_times.split(";") if item]
+            )
+            if candidate.candidate_confidence < 0.80:
+                gate_reason = "missing_beat_confidence_below_0.80"
+            elif proposed_count not in {1, 2}:
+                gate_reason = "only_2T_and_3T_gaps_are_enabled"
+        elif candidate.candidate_type == "extra_beat":
+            if candidate.candidate_confidence < 0.85:
+                gate_reason = "extra_beat_confidence_below_0.85"
+            elif (
+                candidate.beat_probability
+                if candidate.beat_probability is not None
+                else 1.0
+            ) >= 0.35:
+                gate_reason = "middle_beat_has_strong_acoustic_support"
+            elif (candidate.downbeat_probability or 0.0) >= 0.50:
+                gate_reason = "middle_beat_has_downbeat_support"
+        if gate_reason:
+            add_decision(candidate, "rejected", gate_reason)
+            continue
+
+        proposed_records = [BeatRepairRecord(**asdict(item)) for item in records]
+        affected_indices: list[int] = []
+        resulting_times: list[float] = []
+        if candidate.candidate_type == "phase_prefix":
+            proposed_times = np.asarray(
+                [float(item) for item in candidate.proposed_times.split(";") if item],
+                dtype=float,
+            )
+            targets = [
+                item
+                for item in proposed_records
+                if candidate.start_seconds - 1e-6
+                <= item.time_seconds
+                <= candidate.end_seconds + 1e-6
+                and item.original_beat_index is not None
+            ]
+            targets.sort(key=lambda item: item.time_seconds)
+            if len(targets) != len(proposed_times) or len(targets) < 2:
+                add_decision(candidate, "rejected", "phase_projection_size_mismatch")
+                continue
+            shifts = np.abs(
+                proposed_times
+                - np.asarray([item.time_seconds for item in targets], dtype=float)
+            )
+            if float(np.max(shifts)) > 0.25 * reference:
+                add_decision(candidate, "rejected", "phase_shift_exceeds_quarter_period")
+                continue
+            shifted_count = 0
+            for record, new_time in zip(targets, proposed_times):
+                affected_indices.append(int(record.original_beat_index or 0))
+                resulting_times.append(float(new_time))
+                if abs(record.time_seconds - new_time) < 0.04:
+                    record.repair_action = "anchor"
+                else:
+                    record.time_seconds = float(new_time)
+                    record.repair_action = "shift"
+                    shifted_count += 1
+                record.repair_candidate_id = candidate.candidate_id
+                record.repair_confidence = candidate.candidate_confidence
+                record.repair_source = "future_stable_grid"
+                record.repair_note = candidate.diagnostic_note
+            if shifted_count < 2:
+                add_decision(candidate, "rejected", "fewer_than_two_meaningful_shifts")
+                continue
+        elif candidate.candidate_type == "missing_beat":
+            proposed_times = [
+                float(item) for item in candidate.proposed_times.split(";") if item
+            ]
+            for new_time in proposed_times:
+                proposed_records.append(
+                    BeatRepairRecord(
+                        time_seconds=new_time,
+                        original_beat_index=None,
+                        original_time_seconds=None,
+                        repair_action="insert",
+                        repair_candidate_id=candidate.candidate_id,
+                        repair_confidence=candidate.candidate_confidence,
+                        repair_source="local_period_grid",
+                        repair_note=candidate.diagnostic_note,
+                    )
+                )
+                resulting_times.append(new_time)
+        else:
+            target = next(
+                (
+                    item
+                    for item in proposed_records
+                    if item.original_beat_index == candidate.affected_beat_index
+                ),
+                None,
+            )
+            if target is None:
+                add_decision(candidate, "rejected", "target_beat_not_found")
+                continue
+            affected_indices.append(int(target.original_beat_index or 0))
+            proposed_records.remove(target)
+
+        proposed_records.sort(key=lambda item: item.time_seconds)
+        changed_times = [
+            item.time_seconds
+            for item in proposed_records
+            if item.repair_candidate_id == candidate.candidate_id
+        ]
+        if any(
+            item < segment_bounds[0] or item > segment_bounds[1]
+            for item in changed_times
+        ):
+            add_decision(candidate, "rejected", "repair_crosses_activity_segment")
+            continue
+        proposed_times_array = np.asarray(
+            [item.time_seconds for item in proposed_records], dtype=float
+        )
+        if len(proposed_times_array) > 1 and np.any(np.diff(proposed_times_array) <= 1e-5):
+            add_decision(candidate, "rejected", "repair_breaks_strict_time_order")
+            continue
+        before_cost, before_max = _repair_local_cost(
+            records,
+            candidate.start_seconds,
+            candidate.end_seconds,
+            reference,
+            segment_bounds,
+        )
+        after_cost, after_max = _repair_local_cost(
+            proposed_records,
+            candidate.start_seconds,
+            candidate.end_seconds,
+            reference,
+            segment_bounds,
+        )
+        improvement = (
+            (before_cost - after_cost) / before_cost
+            if np.isfinite(before_cost) and before_cost > 1e-9
+            else 0.0
+        )
+        if improvement < 0.25:
+            add_decision(
+                candidate,
+                "rejected",
+                "local_cost_improvement_below_25_percent",
+                before_cost,
+                after_cost,
+            )
+            continue
+        if after_max > before_max + 0.02:
+            add_decision(
+                candidate,
+                "rejected",
+                "repair_creates_a_larger_local_outlier",
+                before_cost,
+                after_cost,
+            )
+            continue
+        records = proposed_records
+        occupied_ranges.append((candidate.start_seconds, candidate.end_seconds))
+        add_decision(
+            candidate,
+            "preview_applied" if mode == "preview" else "applied",
+            "passed_conservative_gates",
+            before_cost,
+            after_cost,
+            ";".join(str(item) for item in affected_indices if item),
+            ";".join(f"{item:.9f}" for item in resulting_times),
+        )
+
+    repaired_times = np.asarray([item.time_seconds for item in records], dtype=float)
+    repaired_downbeats = np.asarray(
+        [item.time_seconds for item in records if item.is_downbeat], dtype=float
+    )
+    result = BeatResult(
+        method="beat-this-repaired",
+        beat_times=repaired_times,
+        downbeat_times=repaired_downbeats,
+        note=(
+            f"P3-B {mode} repair result; fused input is preserved separately"
+        ),
+    )
+    return result, records, decisions
 
 
 NORMALIZED_BPM_MIN = 120.0
@@ -1678,32 +2025,113 @@ def read_repair_candidates_csv(path: Path) -> list[RepairCandidate]:
     ]
 
 
-def write_diagnostic_repaired_beats_csv(source_path: Path, path: Path) -> None:
-    """Write P3-A's unchanged repair interface from the saved fused CSV."""
-    with source_path.open(newline="", encoding="utf-8-sig") as handle:
+def write_repaired_beats_csv(
+    path: Path,
+    result: BeatResult,
+    records: list[BeatRepairRecord],
+    sample_rate: int,
+    ranges: list[tuple[float, float]],
+) -> None:
+    midpoints, raw_bpm, smooth_bpm = local_tempo(result.beat_times)
+    write_beats_csv(
+        path,
+        result,
+        midpoints,
+        raw_bpm,
+        smooth_bpm,
+        sample_rate,
+        ranges,
+    )
+    with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         rows = list(reader)
         source_fields = list(reader.fieldnames or [])
+    if len(rows) != len(records):
+        raise ValueError("Repaired beat rows do not match repair provenance records")
     extra_fields = [
+        "original_beat_index",
         "original_time_seconds",
         "repaired_time_seconds",
         "repair_action",
         "repair_candidate_id",
+        "repair_confidence",
+        "repair_source",
+        "repair_note",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=source_fields + extra_fields)
         writer.writeheader()
-        for row in rows:
-            time_seconds = row["beat_time_seconds"]
+        for row, record in zip(rows, records):
             row.update(
                 {
-                    "original_time_seconds": time_seconds,
-                    "repaired_time_seconds": time_seconds,
-                    "repair_action": "none",
-                    "repair_candidate_id": "",
+                    "original_beat_index": (
+                        ""
+                        if record.original_beat_index is None
+                        else record.original_beat_index
+                    ),
+                    "original_time_seconds": _optional_number(
+                        record.original_time_seconds, 9
+                    ),
+                    "repaired_time_seconds": f"{record.time_seconds:.9f}",
+                    "repair_action": record.repair_action,
+                    "repair_candidate_id": (
+                        ""
+                        if record.repair_candidate_id is None
+                        else record.repair_candidate_id
+                    ),
+                    "repair_confidence": f"{record.repair_confidence:.6f}",
+                    "repair_source": record.repair_source,
+                    "repair_note": record.repair_note,
                 }
             )
             writer.writerow(row)
+
+
+def write_repair_decisions_csv(
+    path: Path, decisions: list[RepairDecision]
+) -> None:
+    fieldnames = list(RepairDecision.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in decisions:
+            row = asdict(item)
+            for field in ("start_seconds", "end_seconds"):
+                row[field] = f"{row[field]:.9f}"
+            row["candidate_confidence"] = f"{item.candidate_confidence:.6f}"
+            for field in (
+                "local_cost_before",
+                "local_cost_after",
+                "cost_improvement",
+            ):
+                row[field] = _optional_number(row[field], 6)
+            writer.writerow(row)
+
+
+def read_repair_decisions_csv(path: Path) -> list[RepairDecision]:
+    def optional(row: dict[str, str], field: str) -> float | None:
+        value = row.get(field, "")
+        return float(value) if value not in {None, ""} else None
+
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return [
+        RepairDecision(
+            candidate_id=int(row["candidate_id"]),
+            candidate_type=row["candidate_type"],
+            status=row["status"],
+            reason=row["reason"],
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+            candidate_confidence=float(row["candidate_confidence"]),
+            local_cost_before=optional(row, "local_cost_before"),
+            local_cost_after=optional(row, "local_cost_after"),
+            cost_improvement=optional(row, "cost_improvement"),
+            affected_original_indices=row["affected_original_indices"],
+            resulting_times=row["resulting_times"],
+        )
+        for row in rows
+    ]
 
 
 def write_click_track(path: Path, y: np.ndarray, sr: int, result: BeatResult) -> None:
@@ -1962,6 +2390,86 @@ def write_diagnostics_plot(
     plt.close(fig)
 
 
+def write_repair_comparison_plot(
+    path: Path,
+    title: str,
+    fused_result: BeatResult,
+    repaired_result: BeatResult,
+    decisions: list[RepairDecision],
+    duration: float,
+    blocked_ranges: list[tuple[float, float]],
+) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(14, 6.8), sharex=True)
+    axes[0].scatter(
+        fused_result.beat_times,
+        np.ones(len(fused_result.beat_times)),
+        marker="|",
+        s=55,
+        color="tab:blue",
+        label="fused",
+    )
+    axes[0].scatter(
+        repaired_result.beat_times,
+        np.zeros(len(repaired_result.beat_times)),
+        marker="|",
+        s=55,
+        color="tab:orange",
+        label="repaired proposal",
+    )
+    axes[0].set_yticks([0, 1], ["repaired", "fused"])
+    axes[0].set_ylim(-0.6, 1.6)
+
+    fused_mid, _, fused_bpm = local_tempo(fused_result.beat_times)
+    repaired_mid, _, repaired_bpm = local_tempo(repaired_result.beat_times)
+    axes[1].plot(
+        fused_mid,
+        fused_bpm,
+        color="tab:blue",
+        linewidth=0.9,
+        alpha=0.65,
+        label="fused robust BPM",
+    )
+    axes[1].plot(
+        repaired_mid,
+        repaired_bpm,
+        color="tab:orange",
+        linewidth=1.0,
+        alpha=0.8,
+        label="repaired robust BPM",
+    )
+    shown_status = False
+    for item in decisions:
+        if item.status not in {"preview_applied", "applied"}:
+            continue
+        for ax in axes:
+            ax.axvspan(
+                item.start_seconds,
+                item.end_seconds,
+                color="tab:green",
+                alpha=0.12,
+                label="accepted repair" if not shown_status else None,
+            )
+        shown_status = True
+    for ax in axes:
+        for blocked_index, (start, end) in enumerate(blocked_ranges):
+            ax.axvspan(
+                start,
+                end,
+                color="0.5",
+                alpha=0.16,
+                label="NO_BEAT" if blocked_index == 0 else None,
+            )
+        ax.set_xlim(0, duration)
+        ax.grid(alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[1].set_ylabel("BPM")
+    axes[1].set_xlabel("Time (seconds)")
+    fig.suptitle(f"{title} — P3-B fused/repaired comparison")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def write_grid_plot(
     path: Path,
     title: str,
@@ -1983,7 +2491,7 @@ def write_grid_plot(
                 color="tab:blue",
                 linewidth=1.0,
                 alpha=0.65,
-                label="fused base BPM" if range_index == 0 else None,
+                label="grid-input base BPM" if range_index == 0 else None,
             )
             axes[0].plot(
                 decoding.interval_midpoints[mask],
@@ -2066,6 +2574,9 @@ def analyse_file(
         "repaired": file_output / f"{stem}__beat-this-repaired__beats.csv",
         "diagnostics": file_output / f"{stem}__beat-this__diagnostics.csv",
         "repairs": file_output / f"{stem}__beat-this__repairs.csv",
+        "repair_decisions": (
+            file_output / f"{stem}__beat-this__repair-decisions.csv"
+        ),
         "normalized": file_output / f"{stem}__beat-this-normalized__beats.csv",
         "grid": file_output / f"{stem}__beat-this__grid.csv",
     }
@@ -2160,14 +2671,35 @@ def analyse_file(
     )
     write_interval_diagnostics_csv(paths["diagnostics"], interval_diagnostics)
     write_repair_candidates_csv(paths["repairs"], repair_candidates)
-    write_diagnostic_repaired_beats_csv(paths["fused"], paths["repaired"])
 
     # Diagnostic plots and reports also consume the saved CSV representation.
     interval_diagnostics = read_interval_diagnostics_csv(paths["diagnostics"])
     repair_candidates = read_repair_candidates_csv(paths["repairs"])
-    # P3-A deliberately continues to normalize the unmodified fused result.
-    normalized_result, grid_decoding = build_normalized_grid(
+    repaired_result, repair_records, repair_decisions = apply_conservative_repairs(
         fused_result,
+        repair_candidates,
+        ranges,
+        args.repair_mode,
+    )
+    write_repaired_beats_csv(
+        paths["repaired"],
+        repaired_result,
+        repair_records,
+        sr,
+        ranges,
+    )
+    write_repair_decisions_csv(paths["repair_decisions"], repair_decisions)
+    repaired_result = read_beats_csv(
+        paths["repaired"],
+        "beat-this-repaired",
+        repaired_result.note,
+    )
+    repair_decisions = read_repair_decisions_csv(paths["repair_decisions"])
+    grid_input = (
+        repaired_result if args.repair_mode == "conservative" else fused_result
+    )
+    normalized_result, grid_decoding = build_normalized_grid(
+        grid_input,
         frames,
         ranges,
     )
@@ -2192,7 +2724,7 @@ def analyse_file(
         normalized_result.note,
     )
     grid_decoding = read_grid_decisions_csv(paths["grid"])
-    stored_results = [raw_result, fused_result, normalized_result]
+    stored_results = [raw_result, fused_result, repaired_result, normalized_result]
     analyses = [
         analyse_result_from_ranges(result, ranges, duration, args, audio_path)
         for result in stored_results
@@ -2224,6 +2756,15 @@ def analyse_file(
         fused_result,
         interval_diagnostics,
         repair_candidates,
+        duration,
+        blocked_ranges,
+    )
+    write_repair_comparison_plot(
+        file_output / f"{stem}__beat-this__repair-comparison.png",
+        audio_path.name,
+        fused_result,
+        repaired_result,
+        repair_decisions,
         duration,
         blocked_ranges,
     )
@@ -2298,8 +2839,6 @@ def analyse_file(
         "p3a_diagnostics": {
             "diagnostics_csv": paths["diagnostics"].name,
             "repair_candidates_csv": paths["repairs"].name,
-            "repaired_interface_csv": paths["repaired"].name,
-            "repairs_applied": 0,
             "intervals": len(interval_diagnostics),
             "candidate_counts": {
                 candidate_type: sum(
@@ -2314,8 +2853,44 @@ def analyse_file(
                 )
             },
             "note": (
-                "P3-A is diagnostic only. The repaired beat CSV is an unchanged "
-                "copy interface, and normalization still consumes fused beats."
+                "P3-A emits broad diagnostic candidates; P3-B separately "
+                "adjudicates them with conservative gates."
+            ),
+        },
+        "p3b_repairs": {
+            "mode": args.repair_mode,
+            "repair_decisions_csv": paths["repair_decisions"].name,
+            "repaired_beats_csv": paths["repaired"].name,
+            "normalization_input": (
+                "beat-this-repaired"
+                if args.repair_mode == "conservative"
+                else "beat-this-fused"
+            ),
+            "accepted_repairs": sum(
+                item.status in {"preview_applied", "applied"}
+                for item in repair_decisions
+            ),
+            "applied_to_normalization": sum(
+                item.status == "applied" for item in repair_decisions
+            ),
+            "inserted_beats": sum(
+                item.repair_action == "insert" for item in repair_records
+            ),
+            "shifted_beats": sum(
+                item.repair_action == "shift" for item in repair_records
+            ),
+            "removed_beats": sum(
+                item.status in {"preview_applied", "applied"}
+                and item.candidate_type == "extra_beat"
+                for item in repair_decisions
+            ),
+            "rejected_candidates": sum(
+                item.status == "rejected" for item in repair_decisions
+            ),
+            "note": (
+                "Preview writes and auditions the conservative repair proposal "
+                "without feeding it to normalization. Conservative mode uses "
+                "the saved repaired CSV as grid input."
             ),
         },
         "grid_normalization": {
@@ -2338,6 +2913,7 @@ def analyse_file(
         "interpretation_note": (
             "All plots and reports are regenerated from saved CSV data. "
             "NO_BEAT ranges are excluded from clicks, tempo statistics, and grid decoding. "
+            f"P3-B repair mode is {args.repair_mode}. "
             "Highlighted tempo-change regions are candidates, not ground truth. "
             "Exact 2x/0.5x tempo changes are musically ambiguous; raw BPM remains in each beat CSV."
         ),
@@ -2392,6 +2968,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip Beat This! and rebuild normalized CSVs, clicks, plots, and "
             "reports from cached inference CSVs plus the editable segments CSV"
+        ),
+    )
+    parser.add_argument(
+        "--repair-mode",
+        choices=("off", "preview", "conservative"),
+        default="preview",
+        help=(
+            "P3-B beat repair mode: off keeps fused beats; preview writes and "
+            "auditions proposals without changing normalization (default); "
+            "conservative feeds accepted repaired beats into normalization"
         ),
     )
     return parser
