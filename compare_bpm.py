@@ -79,6 +79,16 @@ class FramePredictions:
 
 
 @dataclass
+class GridDecoding:
+    interval_midpoints: np.ndarray
+    base_bpm: np.ndarray
+    selected_scale: np.ndarray
+    normalized_bpm: np.ndarray
+    confidence: np.ndarray
+    segment_id: np.ndarray
+
+
+@dataclass
 class TempoRegion:
     start_seconds: float
     end_seconds: float
@@ -242,6 +252,244 @@ def local_tempo(beat_times: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     return midpoints, raw, smooth
 
 
+NORMALIZED_BPM_MIN = 120.0
+NORMALIZED_BPM_MAX = 240.0
+GRID_SCALES = np.asarray([0.25, 0.5, 1.0, 2.0, 4.0], dtype=float)
+
+
+def decode_grid_scales(base_bpm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Choose a metrical scale path whose BPM stays in [120, 240)."""
+    bpm = np.asarray(base_bpm, dtype=float)
+    if not len(bpm):
+        return np.asarray([], dtype=int), np.asarray([], dtype=float)
+
+    normalized = bpm[:, None] * GRID_SCALES[None, :]
+    valid = (normalized >= NORMALIZED_BPM_MIN) & (normalized < NORMALIZED_BPM_MAX)
+    distance = np.where(
+        normalized < NORMALIZED_BPM_MIN,
+        np.log2(NORMALIZED_BPM_MIN / np.maximum(normalized, 1e-6)),
+        np.where(
+            normalized >= NORMALIZED_BPM_MAX,
+            np.log2(normalized / NORMALIZED_BPM_MAX),
+            0.0,
+        ),
+    )
+    # Staying outside the canonical range is much more expensive than changing
+    # metrical level. Continuity still breaks ties and suppresses weak flicker.
+    emission = np.where(valid, 0.0, 25.0 + 80.0 * distance**2)
+    n_frames, n_states = emission.shape
+    costs = np.full((n_frames, n_states), np.inf)
+    backpointers = np.zeros((n_frames, n_states), dtype=int)
+    costs[0] = emission[0]
+    for index in range(1, n_frames):
+        previous_normalized = normalized[index - 1]
+        for state in range(n_states):
+            tempo_jump = np.abs(
+                np.log2(
+                    np.maximum(normalized[index, state], 1e-6)
+                    / np.maximum(previous_normalized, 1e-6)
+                )
+            )
+            scale_jump = np.abs(np.log2(GRID_SCALES[state] / GRID_SCALES))
+            transition = 3.0 * np.minimum(tempo_jump, 1.0) + 0.6 * scale_jump
+            candidates = costs[index - 1] + transition
+            best_previous = int(np.argmin(candidates))
+            costs[index, state] = emission[index, state] + candidates[best_previous]
+            backpointers[index, state] = best_previous
+
+    states = np.zeros(n_frames, dtype=int)
+    states[-1] = int(np.argmin(costs[-1]))
+    for index in range(n_frames - 1, 0, -1):
+        states[index - 1] = backpointers[index, states[index]]
+
+    sorted_emission = np.sort(emission, axis=1)
+    margin = sorted_emission[:, 1] - sorted_emission[:, 0]
+    confidence = 1.0 - np.exp(-margin / 10.0)
+    return states, confidence
+
+
+def _frame_index(time_seconds: float, frames: FramePredictions) -> int:
+    return int(
+        np.clip(
+            round(time_seconds * frames.fps),
+            0,
+            len(frames.fused_beat_logits) - 1,
+        )
+    )
+
+
+def build_normalized_grid(
+    fused_result: BeatResult,
+    frames: FramePredictions,
+    snap_radius_seconds: float = 0.08,
+) -> tuple[BeatResult, GridDecoding]:
+    """Build a normalized beat grid from the selected metrical-level path."""
+    beat_times = np.asarray(fused_result.beat_times, dtype=float)
+    midpoints, _, base_bpm = local_tempo(beat_times)
+    if len(beat_times) < 2 or not len(base_bpm):
+        empty = np.asarray([], dtype=float)
+        return (
+            BeatResult(
+                method="beat-this-normalized",
+                beat_times=beat_times.copy(),
+                downbeat_times=np.asarray([], dtype=float),
+                note="Insufficient beats for metrical-level normalization",
+            ),
+            GridDecoding(empty, empty, empty, empty, empty, empty),
+        )
+
+    states, confidence = decode_grid_scales(base_bpm)
+    selected_scale = GRID_SCALES[states]
+    normalized_bpm = base_bpm * selected_scale
+    segment_id = np.r_[0, np.cumsum(states[1:] != states[:-1])].astype(int)
+    beat_probability = expit(frames.fused_beat_logits)
+    downbeat_probability = expit(frames.fused_downbeat_logits)
+    radius_frames = max(1, round(snap_radius_seconds * frames.fps))
+
+    def evidence(time_seconds: float) -> float:
+        index = _frame_index(time_seconds, frames)
+        return float(
+            beat_probability[index] + 0.2 * downbeat_probability[index]
+        )
+
+    def snap_inserted_beat(time_seconds: float) -> tuple[float, float]:
+        center = _frame_index(time_seconds, frames)
+        left = max(0, center - radius_frames)
+        right = min(len(beat_probability), center + radius_frames + 1)
+        best = left + int(np.argmax(frames.fused_beat_logits[left:right]))
+        if beat_probability[best] >= 0.5:
+            return best / frames.fps, evidence(best / frames.fps)
+        return time_seconds, evidence(time_seconds)
+
+    candidates: list[tuple[float, float]] = []
+    segment_starts = np.r_[0, np.flatnonzero(states[1:] != states[:-1]) + 1]
+    segment_ends = np.r_[segment_starts[1:], len(states)]
+    for start, end in zip(segment_starts, segment_ends):
+        scale = selected_scale[start]
+        if scale >= 1.0:
+            multiplier = int(round(scale))
+            for interval in range(int(start), int(end)):
+                left_time = beat_times[interval]
+                right_time = beat_times[interval + 1]
+                candidates.append((left_time, evidence(left_time)))
+                for subdivision in range(1, multiplier):
+                    target = left_time + (right_time - left_time) * (
+                        subdivision / multiplier
+                    )
+                    candidates.append(snap_inserted_beat(target))
+            boundary = beat_times[int(end)]
+            candidates.append((boundary, evidence(boundary)))
+        else:
+            stride = int(round(1.0 / scale))
+            indices = np.arange(int(start), int(end) + 1)
+            best_phase = 0
+            best_score = -np.inf
+            for phase in range(stride):
+                selected = indices[(indices - int(start) - phase) % stride == 0]
+                if not len(selected):
+                    continue
+                frame_indices = np.asarray(
+                    [_frame_index(beat_times[index], frames) for index in selected]
+                )
+                score = float(
+                    np.mean(beat_probability[frame_indices])
+                    + 0.35 * np.mean(downbeat_probability[frame_indices])
+                )
+                if score > best_score:
+                    best_score = score
+                    best_phase = phase
+            selected = indices[
+                (indices - int(start) - best_phase) % stride == 0
+            ]
+            for index in selected:
+                time_seconds = beat_times[index]
+                candidates.append((time_seconds, evidence(time_seconds)))
+
+    # Preserve the outer extent, then collapse duplicate boundary candidates.
+    candidates.extend(
+        [
+            (beat_times[0], evidence(beat_times[0])),
+            (beat_times[-1], evidence(beat_times[-1])),
+        ]
+    )
+    candidates.sort(key=lambda item: item[0])
+    deduplicated: list[tuple[float, float]] = []
+    for candidate in candidates:
+        if deduplicated and candidate[0] - deduplicated[-1][0] < 0.08:
+            if candidate[1] > deduplicated[-1][1]:
+                deduplicated[-1] = candidate
+        else:
+            deduplicated.append(candidate)
+
+    # Enforce the canonical range on the final click grid, including transition
+    # boundaries. Resolve over-dense conflicts by evidence, then fill gaps.
+    minimum_period = 60.0 / NORMALIZED_BPM_MAX
+    maximum_period = 60.0 / NORMALIZED_BPM_MIN
+    constrained = deduplicated.copy()
+    while len(constrained) >= 2:
+        intervals = np.diff([item[0] for item in constrained])
+        conflicts = np.flatnonzero(intervals <= minimum_period + 1e-6)
+        if not len(conflicts):
+            break
+        left = int(conflicts[0])
+        right = left + 1
+        if left == 0:
+            remove = right
+        elif right == len(constrained) - 1:
+            remove = left
+        else:
+            remove = left if constrained[left][1] < constrained[right][1] else right
+        constrained.pop(remove)
+
+    regularized: list[tuple[float, float]] = []
+    for index, item in enumerate(constrained[:-1]):
+        regularized.append(item)
+        next_item = constrained[index + 1]
+        gap = next_item[0] - item[0]
+        subdivisions = max(1, int(math.ceil(gap / maximum_period)))
+        for subdivision in range(1, subdivisions):
+            time_seconds = item[0] + gap * subdivision / subdivisions
+            regularized.append((time_seconds, evidence(time_seconds)))
+    if constrained:
+        regularized.append(constrained[-1])
+    corrected_beats = np.asarray([item[0] for item in regularized], dtype=float)
+
+    source_downbeats = np.asarray(
+        fused_result.downbeat_times
+        if fused_result.downbeat_times is not None
+        else [],
+        dtype=float,
+    )
+    corrected_downbeats: list[float] = []
+    for time_seconds in corrected_beats:
+        index = _frame_index(time_seconds, frames)
+        has_source_downbeat = bool(
+            source_downbeats.size
+            and np.min(np.abs(source_downbeats - time_seconds)) <= 0.07
+        )
+        if has_source_downbeat or downbeat_probability[index] >= 0.5:
+            corrected_downbeats.append(time_seconds)
+
+    result = BeatResult(
+        method="beat-this-normalized",
+        beat_times=corrected_beats,
+        downbeat_times=np.asarray(corrected_downbeats, dtype=float),
+        note=(
+            "Offline [120, 240) BPM normalization over "
+            "0.25x/0.5x/1x/2x/4x metrical grids"
+        ),
+    )
+    decoding = GridDecoding(
+        interval_midpoints=midpoints,
+        base_bpm=base_bpm,
+        selected_scale=selected_scale,
+        normalized_bpm=normalized_bpm,
+        confidence=confidence,
+        segment_id=segment_id,
+    )
+    return result, decoding
+
+
 def modal_tempo(midpoints: np.ndarray, bpm: np.ndarray, min_bpm: float, max_bpm: float) -> float:
     """Find the time-weighted dominant tempo rather than merely the median."""
     valid = np.isfinite(bpm) & (bpm >= min_bpm) & (bpm <= max_bpm)
@@ -358,6 +606,34 @@ def write_frame_predictions_csv(path: Path, frames: FramePredictions) -> None:
                     f"{fused_beat_prob[index]:.7f}",
                     f"{frames.fused_downbeat_logits[index]:.7f}",
                     f"{fused_downbeat_prob[index]:.7f}",
+                ]
+            )
+
+
+def write_grid_decisions_csv(path: Path, decoding: GridDecoding) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "interval_index",
+                "interval_midpoint_seconds",
+                "base_smoothed_bpm",
+                "selected_scale",
+                "normalized_bpm",
+                "scale_confidence",
+                "segment_id",
+            ]
+        )
+        for index in range(len(decoding.interval_midpoints)):
+            writer.writerow(
+                [
+                    index,
+                    f"{decoding.interval_midpoints[index]:.6f}",
+                    f"{decoding.base_bpm[index]:.4f}",
+                    f"{decoding.selected_scale[index]:g}",
+                    f"{decoding.normalized_bpm[index]:.4f}",
+                    f"{decoding.confidence[index]:.6f}",
+                    int(decoding.segment_id[index]),
                 ]
             )
 
@@ -505,6 +781,54 @@ def write_probability_plot(
     plt.close(fig)
 
 
+def write_grid_plot(
+    path: Path,
+    title: str,
+    decoding: GridDecoding,
+    duration: float,
+) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(13, 6.4), sharex=True)
+    axes[0].plot(
+        decoding.interval_midpoints,
+        decoding.base_bpm,
+        linewidth=1.0,
+        alpha=0.65,
+        label="fused base BPM",
+    )
+    axes[0].plot(
+        decoding.interval_midpoints,
+        decoding.normalized_bpm,
+        linewidth=1.3,
+        label="normalized BPM",
+    )
+    axes[0].axhspan(
+        NORMALIZED_BPM_MIN,
+        NORMALIZED_BPM_MAX,
+        color="tab:green",
+        alpha=0.08,
+        label="target [120, 240)",
+    )
+    axes[0].set_ylabel("BPM")
+    axes[0].grid(alpha=0.2)
+    axes[0].legend(loc="upper right", fontsize=8)
+    axes[1].step(
+        decoding.interval_midpoints,
+        decoding.selected_scale,
+        where="mid",
+        linewidth=1.2,
+    )
+    axes[1].set_yscale("log", base=2)
+    axes[1].set_yticks(GRID_SCALES, [f"{scale:g}x" for scale in GRID_SCALES])
+    axes[1].set_ylabel("Selected grid")
+    axes[1].set_xlabel("Time (seconds)")
+    axes[1].set_xlim(0, duration)
+    axes[1].grid(alpha=0.2)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def analyse_file(
     audio_path: Path,
     output_root: Path,
@@ -518,6 +842,11 @@ def analyse_file(
     file_output.mkdir(parents=True, exist_ok=True)
 
     results, frames = estimator(y, sr)
+    fused_result = next(
+        result for result in results if result.method == "beat-this-fused"
+    )
+    normalized_result, grid_decoding = build_normalized_grid(fused_result, frames)
+    results.append(normalized_result)
     analyses: list[dict] = []
     for result in results:
         result.beat_times = np.unique(
@@ -559,6 +888,9 @@ def analyse_file(
     write_frame_predictions_csv(
         file_output / f"{stem}__beat-this__frames.csv", frames
     )
+    write_grid_decisions_csv(
+        file_output / f"{stem}__beat-this__grid.csv", grid_decoding
+    )
     write_plot(file_output / f"{stem}__tempo.png", audio_path.name, analyses, duration)
     write_probability_plot(
         file_output / f"{stem}__probabilities.png",
@@ -566,6 +898,36 @@ def analyse_file(
         frames,
         duration,
     )
+    write_grid_plot(
+        file_output / f"{stem}__grid.png",
+        audio_path.name,
+        grid_decoding,
+        duration,
+    )
+    fused_intervals = np.diff(fused_result.beat_times)
+    normalized_intervals = np.diff(normalized_result.beat_times)
+    normalized_grid_bpm = np.divide(
+        60.0,
+        normalized_intervals,
+        out=np.full_like(normalized_intervals, np.inf),
+        where=normalized_intervals > 0,
+    )
+    scale_usage = []
+    for scale in GRID_SCALES:
+        mask = grid_decoding.selected_scale == scale
+        seconds = float(np.sum(fused_intervals[mask])) if len(mask) else 0.0
+        scale_usage.append(
+            {
+                "scale": float(scale),
+                "intervals": int(np.sum(mask)),
+                "seconds": round(seconds, 3),
+                "time_percent": (
+                    round(100.0 * seconds / np.sum(fused_intervals), 2)
+                    if np.sum(fused_intervals) > 0
+                    else 0.0
+                ),
+            }
+        )
     report = {
         "audio": str(audio_path.resolve()),
         "duration_seconds": round(duration, 3),
@@ -575,6 +937,23 @@ def analyse_file(
             "hop_seconds": frames.hop_seconds,
             "overlap_windows": frames.overlap_windows,
             "aggregation": "Hann-weighted logit mean",
+        },
+        "grid_normalization": {
+            "target_bpm_interval": "[120, 240)",
+            "candidate_scales": [float(scale) for scale in GRID_SCALES],
+            "scale_usage": scale_usage,
+            "intervals_outside_target_after_selection": int(
+                np.sum(
+                    (grid_decoding.normalized_bpm < NORMALIZED_BPM_MIN)
+                    | (grid_decoding.normalized_bpm >= NORMALIZED_BPM_MAX)
+                )
+            ),
+            "final_grid_intervals_outside_target": int(
+                np.sum(
+                    (normalized_grid_bpm < NORMALIZED_BPM_MIN)
+                    | (normalized_grid_bpm >= NORMALIZED_BPM_MAX)
+                )
+            ),
         },
         "interpretation_note": (
             "Compare raw and fused click-track WAVs. Highlighted regions are candidates, "

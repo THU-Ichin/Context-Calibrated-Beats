@@ -3,6 +3,8 @@
 脚本 `compare_bpm.py` 使用 `Beat This!` 预训练 Transformer 输出 beat 和 downbeat，
 并生成局部 BPM、疑似变速区间和试听用 click-track。脚本同时保留官方分块基线，
 并使用重叠窗口融合逐帧 logits，以减少约 30 秒分块处的硬接缝。
+融合结果随后进入五层网格解码器，在 `0.25x / 0.5x / 1x / 2x / 4x`
+候选中选择路径，并将最终 click 网格归一化到 `[120, 240)` BPM。
 
 `librosa` 只用于音频读取、时长计算、click 合成和归一化，不再参与节拍检测。
 
@@ -60,16 +62,19 @@ python compare_bpm.py "audio\Reply.mp3" -o bpm_results --beat-this-hop-seconds 5
 
 - `__beat-this-raw__beats.csv`：官方 30 秒分块、`keep_first` 拼接后的拍点；
 - `__beat-this-fused__beats.csv`：重叠窗口 Hann 加权融合后的拍点；
-- 对应的 `__clicks.wav`：raw/fused 两套试听文件，高音点击代表 downbeat；
+- `__beat-this-normalized__beats.csv`：五层网格解码和最终间距约束后的拍点；
+- 对应的 `__clicks.wav`：raw/fused/normalized 三套试听文件，高音点击代表 downbeat；
 - `__beat-this__frames.csv`：50 FPS 的 raw/fused beat、downbeat logits 和概率；
-- `__tempo.png`：raw/fused 两套拍点计算出的局部 BPM 对比；
+- `__beat-this__grid.csv`：每个区间的基础 BPM、选中倍率、归一化 BPM 和置信度；
+- `__tempo.png`：raw/fused/normalized 三套拍点计算出的局部 BPM 对比；
 - `__probabilities.png`：raw/fused 逐帧 beat/downbeat 概率对比；
+- `__grid.png`：基础 BPM、归一化 BPM 和选中网格倍率；
 - `__report.json`：主导 BPM 和疑似变速区间；
 - 根目录 `summary.csv`：所有歌曲的 raw/fused 汇总。
 
-判断好坏时，优先 A/B 试听 raw/fused 两套 `__clicks.wav`：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
+判断好坏时，优先试听 normalized，并与 raw/fused 两套 `__clicks.wav` 做 A/B：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
 
-重叠融合只处理分块接缝，并不会自动修复半速/倍速层级。层级修复属于下一阶段的软时序解码。
+网格解码器利用离线动态规划选择倍率。高倍率网格会在理论位置附近搜索 fused logit 峰补拍，低倍率网格会比较不同相位后删拍；最后解决小于 0.25 秒的冲突并填补大于 0.5 秒的缺口，使最终相邻拍点满足 `[120, 240)`。
 
 ## 关于“瞬时 BPM”
 
