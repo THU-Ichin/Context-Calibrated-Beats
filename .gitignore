@@ -1,0 +1,33 @@
+# Python environments and caches
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+
+# IDE settings
+.idea/
+.vscode/
+
+# Test audio and model binaries
+audio/*
+!audio/.gitkeep
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ckpt
+*.pt
+*.pth
+
+# Generated analysis results
+bpm_results*/
+result_plp*/
+click_test_loud/
+reply_click_loud/
+inference_*/
+jp_font/
+
+# Local backups and platform files
+*.bak-*
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+librosa>=0.10.2
+matplotlib>=3.8
+soundfile>=0.12
+beat-this>=0.0.8
