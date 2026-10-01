@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Analyse beats and local tempo with Beat This! on one or more music files.
 
-For every input file, this script writes:
-  * one CSV row per detected beat, including raw and smoothed local BPM;
-  * a WAV file with audible clicks at the detected beats;
-  * a PNG plot of local tempo over time;
+For every input file, this script writes the official raw and overlap-fused:
+  * framewise beat/downbeat logits and probabilities;
+  * beat CSVs with raw and smoothed local BPM;
+  * WAV files with audible clicks at the detected beats;
+  * tempo and probability comparison plots;
   * a CSV summary and a JSON report of possible tempo-change regions.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
@@ -30,6 +31,7 @@ import numpy as np
 import soundfile as sf
 from matplotlib import font_manager
 from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.special import expit
 
 
 def configure_plot_fonts() -> str | None:
@@ -65,6 +67,18 @@ class BeatResult:
 
 
 @dataclass
+class FramePredictions:
+    fps: float
+    raw_beat_logits: np.ndarray
+    raw_downbeat_logits: np.ndarray
+    fused_beat_logits: np.ndarray
+    fused_downbeat_logits: np.ndarray
+    window_seconds: float
+    hop_seconds: float
+    overlap_windows: int
+
+
+@dataclass
 class TempoRegion:
     start_seconds: float
     end_seconds: float
@@ -74,33 +88,129 @@ class TempoRegion:
 
 
 class BeatThisEstimator:
-    """Lazily load Beat This! once and reuse it for all input files."""
+    """Run the official baseline plus overlap-weighted frame inference."""
 
-    def __init__(self, device: str, checkpoint: str):
+    FPS = 50.0
+    WINDOW_FRAMES = 1500
+    BORDER_FRAMES = 6
+
+    def __init__(self, device: str, checkpoint: str, hop_seconds: float = 10.0):
         try:
-            from beat_this.inference import Audio2Beats
+            import torch
+            import torch.nn.functional as torch_functional
+            from beat_this.inference import Audio2Frames
+            from beat_this.model.postprocessor import Postprocessor
         except ImportError as exc:
             raise RuntimeError(
                 "Beat This! is not installed. Run: python -m pip install beat-this"
             ) from exc
-        # Feed the waveform already decoded by librosa. This avoids making the
-        # neural method depend on a second MP3/FLAC decoder such as torchcodec.
-        self.model = Audio2Beats(checkpoint_path=checkpoint, device=device, dbn=False)
+        if not 0 < hop_seconds < self.WINDOW_FRAMES / self.FPS:
+            raise ValueError("Beat This! overlap hop must be between 0 and 30 seconds")
+        self.torch = torch
+        self.torch_functional = torch_functional
+        self.frame_model = Audio2Frames(checkpoint_path=checkpoint, device=device)
+        self.postprocessor = Postprocessor(type="minimal", fps=int(self.FPS))
+        self.hop_frames = max(1, round(hop_seconds * self.FPS))
 
-    def __call__(self, y: np.ndarray, sr: int) -> BeatResult:
-        output = self.model(y, sr)
-        if not isinstance(output, (tuple, list)) or len(output) != 2:
-            raise RuntimeError(f"Unexpected Beat This! output: {type(output)!r}")
+    def _overlap_fused_logits(self, spect) -> tuple[object, object, int]:
+        """Infer shifted 30-second windows and Hann-average their logits."""
+        torch = self.torch
+        border = self.BORDER_FRAMES
+        full_frames = int(spect.shape[0])
+        padded = self.torch_functional.pad(spect, (0, 0, border, border))
+        padded_frames = int(padded.shape[0])
 
-        # The official public API is (beats, downbeats).  Keep this assignment
-        # explicit so it is easy to adjust if using a fork with a different API.
-        beats, downbeats = output
-        return BeatResult(
-            method="beat-this",
-            beat_times=np.asarray(beats, dtype=float),
-            downbeat_times=np.asarray(downbeats, dtype=float),
-            note="Pretrained Transformer beat/downbeat tracker",
+        if padded_frames <= self.WINDOW_FRAMES:
+            starts = [0]
+        else:
+            last_start = padded_frames - self.WINDOW_FRAMES
+            starts = list(range(0, last_start + 1, self.hop_frames))
+            if starts[-1] != last_start:
+                starts.append(last_start)
+
+        beat_sum = torch.zeros(padded_frames, device=self.frame_model.device)
+        downbeat_sum = torch.zeros_like(beat_sum)
+        weight_sum = torch.zeros_like(beat_sum)
+        with torch.inference_mode():
+            with torch.autocast(
+                enabled=self.frame_model.float16,
+                device_type=self.frame_model.device.type,
+            ):
+                for start in starts:
+                    chunk = padded[start : start + self.WINDOW_FRAMES]
+                    prediction = self.frame_model.model(chunk.unsqueeze(0))
+                    beat = prediction["beat"][0].float()
+                    downbeat = prediction["downbeat"][0].float()
+                    weights = torch.hann_window(
+                        len(beat),
+                        periodic=False,
+                        dtype=beat.dtype,
+                        device=beat.device,
+                    ).clamp_min(1e-3)
+                    end = start + len(beat)
+                    beat_sum[start:end] += beat * weights
+                    downbeat_sum[start:end] += downbeat * weights
+                    weight_sum[start:end] += weights
+
+        if torch.any(weight_sum <= 0):
+            raise RuntimeError("Overlap fusion left one or more frames uncovered")
+        fused_beat = beat_sum / weight_sum
+        fused_downbeat = downbeat_sum / weight_sum
+        return (
+            fused_beat[border : border + full_frames],
+            fused_downbeat[border : border + full_frames],
+            len(starts),
         )
+
+    @staticmethod
+    def _numpy(tensor) -> np.ndarray:
+        return tensor.detach().float().cpu().numpy()
+
+    def __call__(
+        self, y: np.ndarray, sr: int
+    ) -> tuple[list[BeatResult], FramePredictions]:
+        # Decode once with librosa, then reuse the same spectrogram for the
+        # official hard-splice baseline and the shifted-overlap inference.
+        spect = self.frame_model.signal2spect(y, sr)
+        raw_beat_logits, raw_downbeat_logits = self.frame_model.spect2frames(spect)
+        fused_beat_logits, fused_downbeat_logits, overlap_windows = (
+            self._overlap_fused_logits(spect)
+        )
+
+        raw_beats, raw_downbeats = self.postprocessor(
+            raw_beat_logits, raw_downbeat_logits
+        )
+        fused_beats, fused_downbeats = self.postprocessor(
+            fused_beat_logits, fused_downbeat_logits
+        )
+        results = [
+            BeatResult(
+                method="beat-this-raw",
+                beat_times=np.asarray(raw_beats, dtype=float),
+                downbeat_times=np.asarray(raw_downbeats, dtype=float),
+                note="Official 30-second keep-first chunk aggregation",
+            ),
+            BeatResult(
+                method="beat-this-fused",
+                beat_times=np.asarray(fused_beats, dtype=float),
+                downbeat_times=np.asarray(fused_downbeats, dtype=float),
+                note=(
+                    "30-second shifted windows with Hann-weighted logit fusion "
+                    f"and {self.hop_frames / self.FPS:g}-second hop"
+                ),
+            ),
+        ]
+        frames = FramePredictions(
+            fps=self.FPS,
+            raw_beat_logits=self._numpy(raw_beat_logits),
+            raw_downbeat_logits=self._numpy(raw_downbeat_logits),
+            fused_beat_logits=self._numpy(fused_beat_logits),
+            fused_downbeat_logits=self._numpy(fused_downbeat_logits),
+            window_seconds=self.WINDOW_FRAMES / self.FPS,
+            hop_seconds=self.hop_frames / self.FPS,
+            overlap_windows=overlap_windows,
+        )
+        return results, frames
 
 
 def local_tempo(beat_times: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -201,7 +311,55 @@ def detect_change_regions(
 
 
 def safe_stem(path: Path) -> str:
-    return re.sub(r"[^0-9A-Za-z._-]+", "_", path.stem).strip("._") or "audio"
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", path.stem)
+    return cleaned.strip(" ._") or "audio"
+
+
+def write_frame_predictions_csv(path: Path, frames: FramePredictions) -> None:
+    lengths = {
+        len(frames.raw_beat_logits),
+        len(frames.raw_downbeat_logits),
+        len(frames.fused_beat_logits),
+        len(frames.fused_downbeat_logits),
+    }
+    if len(lengths) != 1:
+        raise ValueError(f"Frame prediction lengths differ: {sorted(lengths)}")
+
+    raw_beat_prob = expit(frames.raw_beat_logits)
+    raw_downbeat_prob = expit(frames.raw_downbeat_logits)
+    fused_beat_prob = expit(frames.fused_beat_logits)
+    fused_downbeat_prob = expit(frames.fused_downbeat_logits)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "frame_index",
+                "time_seconds",
+                "raw_beat_logit",
+                "raw_beat_probability",
+                "raw_downbeat_logit",
+                "raw_downbeat_probability",
+                "fused_beat_logit",
+                "fused_beat_probability",
+                "fused_downbeat_logit",
+                "fused_downbeat_probability",
+            ]
+        )
+        for index in range(lengths.pop()):
+            writer.writerow(
+                [
+                    index,
+                    f"{index / frames.fps:.6f}",
+                    f"{frames.raw_beat_logits[index]:.7f}",
+                    f"{raw_beat_prob[index]:.7f}",
+                    f"{frames.raw_downbeat_logits[index]:.7f}",
+                    f"{raw_downbeat_prob[index]:.7f}",
+                    f"{frames.fused_beat_logits[index]:.7f}",
+                    f"{fused_beat_prob[index]:.7f}",
+                    f"{frames.fused_downbeat_logits[index]:.7f}",
+                    f"{fused_downbeat_prob[index]:.7f}",
+                ]
+            )
 
 
 def write_beats_csv(
@@ -267,25 +425,80 @@ def write_click_track(path: Path, y: np.ndarray, sr: int, result: BeatResult) ->
 def write_plot(
     path: Path,
     title: str,
-    analysis: dict,
+    analyses: list[dict],
     duration: float,
 ) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(13, 4.2))
-    mids = analysis["midpoints"]
-    raw = analysis["raw_bpm"]
-    smooth = analysis["smooth_bpm"]
-    main = analysis["main_bpm"]
-    ax.scatter(mids, raw, s=9, alpha=0.22, label="raw 60 / beat interval")
-    ax.plot(mids, smooth, linewidth=1.5, label="robust local BPM")
-    if np.isfinite(main):
-        ax.axhline(main, color="black", linestyle="--", linewidth=1.0, label=f"main {main:.1f}")
-    for region in analysis["regions"]:
-        ax.axvspan(region.start_seconds, region.end_seconds, color="tab:red", alpha=0.12)
-    ax.set_ylabel("BPM")
-    ax.set_xlabel("Time (seconds)")
-    ax.set_xlim(0, duration)
-    ax.grid(alpha=0.2)
-    ax.legend(loc="upper right", fontsize=8)
+    fig, axes = plt.subplots(
+        len(analyses),
+        1,
+        figsize=(13, 3.4 * len(analyses)),
+        sharex=True,
+    )
+    axes = np.atleast_1d(axes)
+    for ax, analysis in zip(axes, analyses):
+        mids = analysis["midpoints"]
+        raw = analysis["raw_bpm"]
+        smooth = analysis["smooth_bpm"]
+        main = analysis["main_bpm"]
+        ax.scatter(mids, raw, s=9, alpha=0.22, label="raw 60 / beat interval")
+        ax.plot(mids, smooth, linewidth=1.5, label="robust local BPM")
+        if np.isfinite(main):
+            ax.axhline(
+                main,
+                color="black",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"main {main:.1f}",
+            )
+        for region in analysis["regions"]:
+            ax.axvspan(
+                region.start_seconds,
+                region.end_seconds,
+                color="tab:red",
+                alpha=0.12,
+            )
+        ax.set_ylabel("BPM")
+        ax.set_title(analysis["result"].method)
+        ax.set_xlim(0, duration)
+        ax.grid(alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Time (seconds)")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def write_probability_plot(
+    path: Path,
+    title: str,
+    frames: FramePredictions,
+    duration: float,
+) -> None:
+    times = np.arange(len(frames.raw_beat_logits), dtype=float) / frames.fps
+    series = [
+        (
+            "Beat probability",
+            expit(frames.raw_beat_logits),
+            expit(frames.fused_beat_logits),
+        ),
+        (
+            "Downbeat probability",
+            expit(frames.raw_downbeat_logits),
+            expit(frames.fused_downbeat_logits),
+        ),
+    ]
+    fig, axes = plt.subplots(2, 1, figsize=(13, 6.4), sharex=True)
+    for ax, (label, raw, fused) in zip(axes, series):
+        ax.plot(times, raw, linewidth=0.65, alpha=0.65, label="official raw")
+        ax.plot(times, fused, linewidth=0.8, alpha=0.8, label="overlap fused")
+        ax.axhline(0.5, color="black", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.set_ylabel(label)
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlim(0, duration)
+    axes[-1].set_xlabel("Time (seconds)")
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
@@ -304,46 +517,68 @@ def analyse_file(
     file_output = output_root / stem
     file_output.mkdir(parents=True, exist_ok=True)
 
-    result = estimator(y, sr)
-    result.beat_times = np.unique(result.beat_times[np.isfinite(result.beat_times)])
-    midpoints, raw_bpm, smooth_bpm = local_tempo(result.beat_times)
-    main_bpm = modal_tempo(midpoints, smooth_bpm, args.min_bpm, args.max_bpm)
-    regions = detect_change_regions(
-        midpoints,
-        smooth_bpm,
-        main_bpm,
-        relative_threshold=args.change_ratio,
-        absolute_threshold=args.change_bpm,
-        min_intervals=args.min_change_beats,
-        min_duration=args.min_change_seconds,
-    )
-    analysis = {
-        "result": result,
-        "midpoints": midpoints,
-        "raw_bpm": raw_bpm,
-        "smooth_bpm": smooth_bpm,
-        "main_bpm": main_bpm,
-        "regions": regions,
-        "duration": duration,
-        "audio": audio_path,
-    }
+    results, frames = estimator(y, sr)
+    analyses: list[dict] = []
+    for result in results:
+        result.beat_times = np.unique(
+            result.beat_times[np.isfinite(result.beat_times)]
+        )
+        midpoints, raw_bpm, smooth_bpm = local_tempo(result.beat_times)
+        main_bpm = modal_tempo(midpoints, smooth_bpm, args.min_bpm, args.max_bpm)
+        regions = detect_change_regions(
+            midpoints,
+            smooth_bpm,
+            main_bpm,
+            relative_threshold=args.change_ratio,
+            absolute_threshold=args.change_bpm,
+            min_intervals=args.min_change_beats,
+            min_duration=args.min_change_seconds,
+        )
+        analysis = {
+            "result": result,
+            "midpoints": midpoints,
+            "raw_bpm": raw_bpm,
+            "smooth_bpm": smooth_bpm,
+            "main_bpm": main_bpm,
+            "regions": regions,
+            "duration": duration,
+            "audio": audio_path,
+        }
+        analyses.append(analysis)
+        write_beats_csv(
+            file_output / f"{stem}__{result.method}__beats.csv",
+            result,
+            midpoints,
+            raw_bpm,
+            smooth_bpm,
+        )
+        write_click_track(
+            file_output / f"{stem}__{result.method}__clicks.wav", y, sr, result
+        )
 
-    write_beats_csv(
-        file_output / f"{stem}__{result.method}__beats.csv",
-        result,
-        midpoints,
-        raw_bpm,
-        smooth_bpm,
+    write_frame_predictions_csv(
+        file_output / f"{stem}__beat-this__frames.csv", frames
     )
-    write_click_track(
-        file_output / f"{stem}__{result.method}__clicks.wav", y, sr, result
+    write_plot(file_output / f"{stem}__tempo.png", audio_path.name, analyses, duration)
+    write_probability_plot(
+        file_output / f"{stem}__probabilities.png",
+        audio_path.name,
+        frames,
+        duration,
     )
-    write_plot(file_output / f"{stem}__tempo.png", audio_path.name, analysis, duration)
     report = {
         "audio": str(audio_path.resolve()),
         "duration_seconds": round(duration, 3),
+        "frame_inference": {
+            "fps": frames.fps,
+            "window_seconds": frames.window_seconds,
+            "hop_seconds": frames.hop_seconds,
+            "overlap_windows": frames.overlap_windows,
+            "aggregation": "Hann-weighted logit mean",
+        },
         "interpretation_note": (
-            "Highlighted regions are candidates, not ground truth. Check the click-track WAVs. "
+            "Compare raw and fused click-track WAVs. Highlighted regions are candidates, "
+            "not ground truth. "
             "Exact 2x/0.5x tempo changes are musically ambiguous; raw BPM remains in each beat CSV."
         ),
         "methods": [
@@ -362,12 +597,12 @@ def analyse_file(
                 "possible_tempo_change_regions": [asdict(region) for region in item["regions"]],
                 "note": item["result"].note,
             }
-            for item in [analysis]
+            for item in analyses
         ],
     }
     with (file_output / f"{stem}__report.json").open("w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
-    return [analysis]
+    return analyses
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -385,6 +620,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-change-seconds", type=float, default=2.0)
     parser.add_argument("--beat-this-device", default="cpu", help="cpu, cuda, cuda:0, mps...")
     parser.add_argument("--beat-this-checkpoint", default="final0")
+    parser.add_argument(
+        "--beat-this-hop-seconds",
+        type=float,
+        default=10.0,
+        help="Hop between overlapping 30-second inference windows (default: 10)",
+    )
     return parser
 
 
@@ -397,9 +638,16 @@ def main() -> int:
     if not 0 < args.min_bpm < args.max_bpm:
         print("Require 0 < --min-bpm < --max-bpm", file=sys.stderr)
         return 2
+    if not 0 < args.beat_this_hop_seconds < 30:
+        print("Require 0 < --beat-this-hop-seconds < 30", file=sys.stderr)
+        return 2
     args.output.mkdir(parents=True, exist_ok=True)
     try:
-        beat_this = BeatThisEstimator(args.beat_this_device, args.beat_this_checkpoint)
+        beat_this = BeatThisEstimator(
+            args.beat_this_device,
+            args.beat_this_checkpoint,
+            hop_seconds=args.beat_this_hop_seconds,
+        )
     except Exception as exc:
         print(f"Unable to initialize Beat This!: {exc}", file=sys.stderr)
         return 1

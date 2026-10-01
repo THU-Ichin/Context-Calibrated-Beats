@@ -1,7 +1,8 @@
 # Beat This! BPM/节拍分析
 
 脚本 `compare_bpm.py` 使用 `Beat This!` 预训练 Transformer 输出 beat 和 downbeat，
-并生成局部 BPM、疑似变速区间和试听用 click-track。
+并生成局部 BPM、疑似变速区间和试听用 click-track。脚本同时保留官方分块基线，
+并使用重叠窗口融合逐帧 logits，以减少约 30 秒分块处的硬接缝。
 
 `librosa` 只用于音频读取、时长计算、click 合成和归一化，不再参与节拍检测。
 
@@ -23,7 +24,7 @@ python -m pip install -r requirements-bpm.txt
 分析一首歌：
 
 ```powershell
-python compare_bpm.py "D:\Music\song.mp3" -o bpm_results
+python compare_bpm.py "audio\Reply.mp3" -o bpm_results
 ```
 
 一次分析多首：
@@ -46,17 +47,29 @@ python compare_bpm.py "D:\Music\song.mp3" -o bpm_results --min-bpm 70 --max-bpm 
 
 该范围不限制 Beat This! 模型本身的推理。
 
+重叠推理固定使用 30 秒窗口，默认每 10 秒启动一个窗口。可以调整 hop；数值越小，
+同一时刻参与融合的窗口越多，但推理耗时也越长：
+
+```powershell
+python compare_bpm.py "audio\Reply.mp3" -o bpm_results --beat-this-hop-seconds 5
+```
+
 ## 输出怎么看
 
 每首歌有一个独立子目录，其中包含：
 
-- `__beats.csv`：每个节拍的位置、相邻节拍得到的原始 BPM、稳健平滑后的 BPM；
-- `__clicks.wav`：原音频叠加节拍点击声；`Beat This!` 的高音点击代表 downbeat；
-- `__tempo.png`：Beat This! 拍点计算出的局部 BPM 曲线；
+- `__beat-this-raw__beats.csv`：官方 30 秒分块、`keep_first` 拼接后的拍点；
+- `__beat-this-fused__beats.csv`：重叠窗口 Hann 加权融合后的拍点；
+- 对应的 `__clicks.wav`：raw/fused 两套试听文件，高音点击代表 downbeat；
+- `__beat-this__frames.csv`：50 FPS 的 raw/fused beat、downbeat logits 和概率；
+- `__tempo.png`：raw/fused 两套拍点计算出的局部 BPM 对比；
+- `__probabilities.png`：raw/fused 逐帧 beat/downbeat 概率对比；
 - `__report.json`：主导 BPM 和疑似变速区间；
-- 根目录 `summary.csv`：所有歌曲的总表。
+- 根目录 `summary.csv`：所有歌曲的 raw/fused 汇总。
 
-判断好坏时，优先试听 `__clicks.wav`：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
+判断好坏时，优先 A/B 试听 raw/fused 两套 `__clicks.wav`：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
+
+重叠融合只处理分块接缝，并不会自动修复半速/倍速层级。层级修复属于下一阶段的软时序解码。
 
 ## 关于“瞬时 BPM”
 
