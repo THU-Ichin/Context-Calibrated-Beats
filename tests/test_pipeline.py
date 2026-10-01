@@ -232,6 +232,60 @@ class CsvPipelineTest(unittest.TestCase):
             any(item.status == "preview_applied" for item in motion_decisions)
         )
 
+    def test_p3c_phase_grid_keeps_transition_intervals_continuous(self) -> None:
+        beat_times = np.asarray(
+            [
+                0.00,
+                0.34,
+                0.68,
+                1.02,
+                1.36,
+                1.70,
+                2.04,
+                2.72,
+                2.88,
+                3.06,
+                3.22,
+                3.40,
+                3.56,
+                3.92,
+                4.24,
+                4.60,
+                4.94,
+            ]
+        )
+        result, events, transitions = bpm.build_phase_aware_grid(
+            bpm.BeatResult("beat-this-repaired", beat_times),
+            self.frames,
+            [(0.0, 5.0)],
+        )
+        intervals = np.diff(result.beat_times)
+
+        self.assertTrue(np.all(intervals > 60.0 / bpm.NORMALIZED_BPM_MAX))
+        self.assertTrue(np.all(intervals <= 60.0 / bpm.NORMALIZED_BPM_MIN))
+        self.assertLess(float(np.max(intervals)), 0.45)
+        self.assertTrue(
+            {item.selected_scale for item in events}.issubset(set(bpm.GRID_SCALES))
+        )
+        self.assertGreater(len(events), 10)
+        self.assertIsInstance(transitions, list)
+
+    def test_p3c_phase_grid_does_not_bridge_no_beat_ranges(self) -> None:
+        ranges = [(0.0, 3.0), (6.0, 10.0)]
+        result, events, _ = bpm.build_phase_aware_grid(
+            self.result,
+            self.frames,
+            ranges,
+        )
+
+        self.assertFalse(
+            np.any(
+                (result.beat_times >= 3.0)
+                & (result.beat_times < 6.0)
+            )
+        )
+        self.assertEqual({item.activity_segment_id for item in events}, {0, 1})
+
 
 if __name__ == "__main__":
     unittest.main()

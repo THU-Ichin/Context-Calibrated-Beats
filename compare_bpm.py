@@ -11,6 +11,8 @@ For every input file, this script writes the official raw and overlap-fused:
 P3-A writes interval diagnostics and broad repair candidates. P3-B adjudicates
 those candidates into a traceable repaired-beat proposal. Preview mode keeps
 the proposal out of grid normalisation; conservative mode uses its saved CSV.
+P3-C adds a phase-continuous five-scale grid beside the legacy decoder and can
+promote that saved preview to the official normalized output.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -91,6 +93,37 @@ class GridDecoding:
     normalized_bpm: np.ndarray
     confidence: np.ndarray
     segment_id: np.ndarray
+
+
+@dataclass
+class PhaseGridEvent:
+    grid_beat_index: int
+    activity_segment_id: int
+    beat_time_seconds: float
+    selected_scale: float
+    target_period_seconds: float
+    predicted_time_seconds: float
+    phase_residual_seconds: float
+    beat_probability: float
+    downbeat_probability: float
+    event_source: str
+    transition_type: str
+    path_cost: float
+
+
+@dataclass
+class GridTransition:
+    transition_id: int
+    activity_segment_id: int
+    start_seconds: float
+    end_seconds: float
+    previous_scale: float
+    next_scale: float
+    previous_period_seconds: float
+    next_period_seconds: float
+    phase_adjustment_seconds: float
+    transition_type: str
+    diagnostic_note: str
 
 
 @dataclass
@@ -1375,6 +1408,280 @@ def build_normalized_grid(
     return result, decoding
 
 
+def build_phase_aware_grid(
+    repaired_result: BeatResult,
+    frames: FramePredictions,
+    active_ranges: list[tuple[float, float]],
+) -> tuple[BeatResult, list[PhaseGridEvent], list[GridTransition]]:
+    """Track one continuous phase path while using only the five grid scales."""
+    source_times = np.asarray(repaired_result.beat_times, dtype=float)
+    source_downbeats = np.asarray(
+        repaired_result.downbeat_times
+        if repaired_result.downbeat_times is not None
+        else [],
+        dtype=float,
+    )
+    beat_probability = expit(frames.fused_beat_logits)
+    downbeat_probability = expit(frames.fused_downbeat_logits)
+    minimum_period = 60.0 / NORMALIZED_BPM_MAX + 1e-4
+    maximum_period = 60.0 / NORMALIZED_BPM_MIN
+    events: list[PhaseGridEvent] = []
+    transitions: list[GridTransition] = []
+    output_downbeats: list[float] = []
+    path_cost = 0.0
+
+    def probabilities(time_seconds: float) -> tuple[float, float]:
+        index = _frame_index(time_seconds, frames)
+        return float(beat_probability[index]), float(downbeat_probability[index])
+
+    for segment_id, (range_start, range_end) in enumerate(active_ranges):
+        is_last = segment_id == len(active_ranges) - 1
+        mask = (source_times >= range_start) & (
+            (source_times <= range_end) if is_last else (source_times < range_end)
+        )
+        segment_times = source_times[mask]
+        if len(segment_times) < 2:
+            continue
+        midpoints, _, base_bpm = local_tempo(segment_times)
+        states, _ = decode_grid_scales(base_bpm)
+        scales = GRID_SCALES[states]
+        target_periods = np.clip(
+            60.0 / np.maximum(base_bpm * scales, 1e-9),
+            minimum_period,
+            maximum_period,
+        )
+
+        def interval_index(time_seconds: float) -> int:
+            return int(
+                np.clip(
+                    np.searchsorted(midpoints, time_seconds, side="right") - 1,
+                    0,
+                    len(midpoints) - 1,
+                )
+            )
+
+        def scale_at(time_seconds: float) -> float:
+            return float(scales[interval_index(time_seconds)])
+
+        def period_at(time_seconds: float) -> float:
+            if len(midpoints) == 1:
+                return float(target_periods[0])
+            return float(
+                np.interp(
+                    time_seconds,
+                    midpoints,
+                    target_periods,
+                    left=target_periods[0],
+                    right=target_periods[-1],
+                )
+            )
+
+        current = float(segment_times[0])
+        current_scale = scale_at(current)
+        current_period = period_at(current)
+        beat_prob, downbeat_prob = probabilities(current)
+        events.append(
+            PhaseGridEvent(
+                grid_beat_index=len(events) + 1,
+                activity_segment_id=segment_id,
+                beat_time_seconds=current,
+                selected_scale=current_scale,
+                target_period_seconds=current_period,
+                predicted_time_seconds=current,
+                phase_residual_seconds=0.0,
+                beat_probability=beat_prob,
+                downbeat_probability=downbeat_prob,
+                event_source="acoustic_anchor",
+                transition_type="segment_start",
+                path_cost=path_cost,
+            )
+        )
+        if (
+            len(source_downbeats)
+            and np.min(np.abs(source_downbeats - current)) <= 0.07
+        ) or downbeat_prob >= 0.5:
+            output_downbeats.append(current)
+
+        previous_interval: float | None = None
+        previous_scale = current_scale
+        max_events = int(math.ceil((segment_times[-1] - current) / minimum_period)) + 4
+        for _ in range(max_events):
+            first_period = period_at(current)
+            predicted = current + first_period
+            target_period = float(
+                np.clip(
+                    0.5 * (first_period + period_at(predicted)),
+                    minimum_period,
+                    maximum_period,
+                )
+            )
+            if previous_interval is not None:
+                target_period = float(
+                    np.clip(
+                        target_period,
+                        max(minimum_period, 0.85 * previous_interval),
+                        min(maximum_period, 1.15 * previous_interval),
+                    )
+                )
+            predicted = current + target_period
+            if predicted > segment_times[-1] + 1e-6:
+                tail = float(segment_times[-1] - current)
+                if minimum_period <= tail <= maximum_period:
+                    predicted = float(segment_times[-1])
+                    target_period = tail
+                else:
+                    break
+
+            acquisition_radius = min(0.18, 0.55 * target_period)
+            nearby = segment_times[
+                (segment_times >= predicted - acquisition_radius)
+                & (segment_times <= predicted + acquisition_radius)
+                & (segment_times > current + minimum_period - 1e-6)
+            ]
+            predicted_beat, _ = probabilities(predicted)
+            best_time: float | None = None
+            best_score = 0.10 + 0.25 * predicted_beat
+            for candidate_time in nearby:
+                candidate_beat, candidate_downbeat = probabilities(
+                    float(candidate_time)
+                )
+                phase_distance = abs(float(candidate_time) - predicted) / target_period
+                score = (
+                    candidate_beat
+                    + 0.25 * candidate_downbeat
+                    - 1.10 * phase_distance
+                )
+                if score > best_score + 0.05:
+                    best_score = score
+                    best_time = float(candidate_time)
+
+            event_source = "theoretical_grid"
+            next_time = predicted
+            if best_time is not None:
+                residual = best_time - predicted
+                snap_radius = min(0.08, 0.24 * target_period)
+                maximum_adjustment = min(0.05, 0.15 * target_period)
+                if abs(residual) <= snap_radius:
+                    next_time = best_time
+                    event_source = "acoustic_peak"
+                else:
+                    next_time = predicted + float(
+                        np.clip(residual, -maximum_adjustment, maximum_adjustment)
+                    )
+                    event_source = "phase_bridge"
+
+            interval = next_time - current
+            lower = minimum_period
+            upper = maximum_period
+            if previous_interval is not None:
+                lower = max(lower, 0.85 * previous_interval)
+                upper = min(upper, 1.15 * previous_interval)
+            constrained_interval = float(np.clip(interval, lower, upper))
+            if abs(constrained_interval - interval) > 1e-9:
+                next_time = current + constrained_interval
+                event_source = "phase_bridge"
+            if next_time > segment_times[-1] + 1e-6:
+                break
+            interval = next_time - current
+            if interval < minimum_period - 1e-6 or interval > maximum_period + 1e-6:
+                raise ValueError("Phase-aware decoder produced an invalid period")
+
+            selected_scale = scale_at(next_time)
+            phase_residual = next_time - predicted
+            beat_prob, downbeat_prob = probabilities(next_time)
+            scale_changed = selected_scale != previous_scale
+            transition_type = (
+                "scale_switch"
+                if scale_changed
+                else "phase_bridge"
+                if event_source == "phase_bridge"
+                else "stable"
+            )
+            path_cost += (
+                abs(interval - target_period) / max(target_period, 1e-9)
+                + 0.35 * (1.0 - beat_prob)
+                + (0.12 if scale_changed else 0.0)
+            )
+            events.append(
+                PhaseGridEvent(
+                    grid_beat_index=len(events) + 1,
+                    activity_segment_id=segment_id,
+                    beat_time_seconds=float(next_time),
+                    selected_scale=selected_scale,
+                    target_period_seconds=target_period,
+                    predicted_time_seconds=predicted,
+                    phase_residual_seconds=phase_residual,
+                    beat_probability=beat_prob,
+                    downbeat_probability=downbeat_prob,
+                    event_source=event_source,
+                    transition_type=transition_type,
+                    path_cost=path_cost,
+                )
+            )
+            if (
+                len(source_downbeats)
+                and np.min(np.abs(source_downbeats - next_time)) <= 0.07
+            ) or downbeat_prob >= 0.5:
+                output_downbeats.append(float(next_time))
+            if scale_changed or event_source == "phase_bridge":
+                transitions.append(
+                    GridTransition(
+                        transition_id=len(transitions) + 1,
+                        activity_segment_id=segment_id,
+                        start_seconds=current,
+                        end_seconds=float(next_time),
+                        previous_scale=previous_scale,
+                        next_scale=selected_scale,
+                        previous_period_seconds=(
+                            previous_interval
+                            if previous_interval is not None
+                            else target_period
+                        ),
+                        next_period_seconds=interval,
+                        phase_adjustment_seconds=phase_residual,
+                        transition_type=transition_type,
+                        diagnostic_note=(
+                            "Phase was adjusted gradually toward acoustic evidence"
+                            if event_source == "phase_bridge"
+                            else "Metrical scale changed without resetting phase"
+                        ),
+                    )
+                )
+            previous_interval = interval
+            previous_scale = selected_scale
+            current = float(next_time)
+            if segment_times[-1] - current < minimum_period - 1e-6:
+                break
+
+    output_times = np.asarray([item.beat_time_seconds for item in events], dtype=float)
+    for segment_id in range(len(active_ranges)):
+        segment_event_times = np.asarray(
+            [
+                item.beat_time_seconds
+                for item in events
+                if item.activity_segment_id == segment_id
+            ],
+            dtype=float,
+        )
+        if len(segment_event_times) < 2:
+            continue
+        intervals = np.diff(segment_event_times)
+        if np.any(intervals < minimum_period - 1e-6) or np.any(
+            intervals > maximum_period + 1e-6
+        ):
+            raise ValueError("Phase-aware final grid failed canonical range validation")
+    result = BeatResult(
+        method="beat-this-phase-aware",
+        beat_times=output_times,
+        downbeat_times=np.unique(np.asarray(output_downbeats, dtype=float)),
+        note=(
+            "P3-C phase-continuous [120, 240) preview using only "
+            "0.25x/0.5x/1x/2x/4x metrical states"
+        ),
+    )
+    return result, events, transitions
+
+
 def modal_tempo(
     midpoints: np.ndarray,
     bpm: np.ndarray,
@@ -1806,6 +2113,97 @@ def read_grid_decisions_csv(path: Path) -> GridDecoding:
             [int(row["segment_id"]) for row in rows], dtype=int
         ),
     )
+
+
+def write_phase_grid_events_csv(
+    path: Path, events: list[PhaseGridEvent]
+) -> None:
+    fieldnames = list(PhaseGridEvent.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in events:
+            row = asdict(item)
+            for field in (
+                "beat_time_seconds",
+                "target_period_seconds",
+                "predicted_time_seconds",
+                "phase_residual_seconds",
+            ):
+                row[field] = f"{row[field]:.9f}"
+            for field in (
+                "beat_probability",
+                "downbeat_probability",
+                "path_cost",
+            ):
+                row[field] = f"{row[field]:.6f}"
+            row["selected_scale"] = f"{item.selected_scale:g}"
+            writer.writerow(row)
+
+
+def read_phase_grid_events_csv(path: Path) -> list[PhaseGridEvent]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return [
+        PhaseGridEvent(
+            grid_beat_index=int(row["grid_beat_index"]),
+            activity_segment_id=int(row["activity_segment_id"]),
+            beat_time_seconds=float(row["beat_time_seconds"]),
+            selected_scale=float(row["selected_scale"]),
+            target_period_seconds=float(row["target_period_seconds"]),
+            predicted_time_seconds=float(row["predicted_time_seconds"]),
+            phase_residual_seconds=float(row["phase_residual_seconds"]),
+            beat_probability=float(row["beat_probability"]),
+            downbeat_probability=float(row["downbeat_probability"]),
+            event_source=row["event_source"],
+            transition_type=row["transition_type"],
+            path_cost=float(row["path_cost"]),
+        )
+        for row in rows
+    ]
+
+
+def write_grid_transitions_csv(
+    path: Path, transitions: list[GridTransition]
+) -> None:
+    fieldnames = list(GridTransition.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in transitions:
+            row = asdict(item)
+            for field in (
+                "start_seconds",
+                "end_seconds",
+                "previous_period_seconds",
+                "next_period_seconds",
+                "phase_adjustment_seconds",
+            ):
+                row[field] = f"{row[field]:.9f}"
+            row["previous_scale"] = f"{item.previous_scale:g}"
+            row["next_scale"] = f"{item.next_scale:g}"
+            writer.writerow(row)
+
+
+def read_grid_transitions_csv(path: Path) -> list[GridTransition]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return [
+        GridTransition(
+            transition_id=int(row["transition_id"]),
+            activity_segment_id=int(row["activity_segment_id"]),
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+            previous_scale=float(row["previous_scale"]),
+            next_scale=float(row["next_scale"]),
+            previous_period_seconds=float(row["previous_period_seconds"]),
+            next_period_seconds=float(row["next_period_seconds"]),
+            phase_adjustment_seconds=float(row["phase_adjustment_seconds"]),
+            transition_type=row["transition_type"],
+            diagnostic_note=row["diagnostic_note"],
+        )
+        for row in rows
+    ]
 
 
 def write_beats_csv(
@@ -2470,6 +2868,87 @@ def write_repair_comparison_plot(
     plt.close(fig)
 
 
+def write_phase_grid_comparison_plot(
+    path: Path,
+    title: str,
+    legacy_result: BeatResult,
+    phase_result: BeatResult,
+    transitions: list[GridTransition],
+    duration: float,
+    blocked_ranges: list[tuple[float, float]],
+) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7.0), sharex=True)
+    axes[0].scatter(
+        legacy_result.beat_times,
+        np.ones(len(legacy_result.beat_times)),
+        marker="|",
+        s=55,
+        color="tab:blue",
+        label="legacy normalized",
+    )
+    axes[0].scatter(
+        phase_result.beat_times,
+        np.zeros(len(phase_result.beat_times)),
+        marker="|",
+        s=55,
+        color="tab:orange",
+        label="phase-aware",
+    )
+    axes[0].set_yticks([0, 1], ["phase-aware", "legacy"])
+    axes[0].set_ylim(-0.6, 1.6)
+    for result, colour, label in (
+        (legacy_result, "tab:blue", "legacy actual BPM"),
+        (phase_result, "tab:orange", "phase-aware actual BPM"),
+    ):
+        midpoint, raw_bpm, _ = local_tempo(result.beat_times)
+        axes[1].plot(
+            midpoint,
+            raw_bpm,
+            color=colour,
+            linewidth=0.8,
+            alpha=0.72,
+            label=label,
+        )
+    shown_transition = False
+    for item in transitions:
+        if item.transition_type not in {"scale_switch", "phase_bridge"}:
+            continue
+        for ax in axes:
+            ax.axvspan(
+                item.start_seconds,
+                item.end_seconds,
+                color="tab:purple",
+                alpha=0.08,
+                label="phase transition" if not shown_transition else None,
+            )
+        shown_transition = True
+    for ax in axes:
+        for blocked_index, (start, end) in enumerate(blocked_ranges):
+            ax.axvspan(
+                start,
+                end,
+                color="0.5",
+                alpha=0.16,
+                label="NO_BEAT" if blocked_index == 0 else None,
+            )
+        ax.set_xlim(0, duration)
+        ax.grid(alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[1].axhspan(
+        NORMALIZED_BPM_MIN,
+        NORMALIZED_BPM_MAX,
+        color="tab:green",
+        alpha=0.06,
+    )
+    axes[1].set_ylim(100, 250)
+    axes[1].set_ylabel("BPM")
+    axes[1].set_xlabel("Time (seconds)")
+    fig.suptitle(f"{title} — legacy vs P3-C phase-aware grid")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def write_grid_plot(
     path: Path,
     title: str,
@@ -2576,6 +3055,18 @@ def analyse_file(
         "repairs": file_output / f"{stem}__beat-this__repairs.csv",
         "repair_decisions": (
             file_output / f"{stem}__beat-this__repair-decisions.csv"
+        ),
+        "legacy_normalized": (
+            file_output / f"{stem}__beat-this-legacy-normalized__beats.csv"
+        ),
+        "phase_normalized": (
+            file_output / f"{stem}__beat-this-phase-aware__beats.csv"
+        ),
+        "phase_events": (
+            file_output / f"{stem}__beat-this__phase-grid.csv"
+        ),
+        "grid_transitions": (
+            file_output / f"{stem}__beat-this__grid-transitions.csv"
         ),
         "normalized": file_output / f"{stem}__beat-this-normalized__beats.csv",
         "grid": file_output / f"{stem}__beat-this__grid.csv",
@@ -2698,10 +3189,75 @@ def analyse_file(
     grid_input = (
         repaired_result if args.repair_mode == "conservative" else fused_result
     )
-    normalized_result, grid_decoding = build_normalized_grid(
+    legacy_result, grid_decoding = build_normalized_grid(
         grid_input,
         frames,
         ranges,
+    )
+    legacy_result.method = "beat-this-legacy-normalized"
+    legacy_midpoints, legacy_raw, legacy_smooth = local_tempo(
+        legacy_result.beat_times
+    )
+    write_beats_csv(
+        paths["legacy_normalized"],
+        legacy_result,
+        legacy_midpoints,
+        legacy_raw,
+        legacy_smooth,
+        sr,
+        ranges,
+    )
+    write_grid_decisions_csv(paths["grid"], grid_decoding)
+
+    phase_result, phase_events, grid_transitions = build_phase_aware_grid(
+        grid_input,
+        frames,
+        ranges,
+    )
+    phase_midpoints, phase_raw, phase_smooth = local_tempo(
+        phase_result.beat_times
+    )
+    write_beats_csv(
+        paths["phase_normalized"],
+        phase_result,
+        phase_midpoints,
+        phase_raw,
+        phase_smooth,
+        sr,
+        ranges,
+    )
+    write_phase_grid_events_csv(paths["phase_events"], phase_events)
+    write_grid_transitions_csv(paths["grid_transitions"], grid_transitions)
+
+    # Reload derived CSVs too, so plots/reports cannot diverge from saved data.
+    legacy_result = read_beats_csv(
+        paths["legacy_normalized"],
+        "beat-this-legacy-normalized",
+        legacy_result.note,
+    )
+    phase_result = read_beats_csv(
+        paths["phase_normalized"],
+        "beat-this-phase-aware",
+        phase_result.note,
+    )
+    phase_events = read_phase_grid_events_csv(paths["phase_events"])
+    grid_transitions = read_grid_transitions_csv(paths["grid_transitions"])
+    grid_decoding = read_grid_decisions_csv(paths["grid"])
+    selected_grid = (
+        phase_result if args.grid_mode == "phase-aware" else legacy_result
+    )
+    normalized_result = BeatResult(
+        method="beat-this-normalized",
+        beat_times=selected_grid.beat_times.copy(),
+        downbeat_times=(
+            selected_grid.downbeat_times.copy()
+            if selected_grid.downbeat_times is not None
+            else np.asarray([], dtype=float)
+        ),
+        note=(
+            f"Official normalized output from P3-C {args.grid_mode} mode; "
+            f"source={selected_grid.method}"
+        ),
     )
     normalized_midpoints, normalized_raw, normalized_smooth = local_tempo(
         normalized_result.beat_times
@@ -2715,15 +3271,11 @@ def analyse_file(
         sr,
         ranges,
     )
-    write_grid_decisions_csv(paths["grid"], grid_decoding)
-
-    # Reload derived CSVs too, so plots/reports cannot diverge from saved data.
     normalized_result = read_beats_csv(
         paths["normalized"],
         "beat-this-normalized",
         normalized_result.note,
     )
-    grid_decoding = read_grid_decisions_csv(paths["grid"])
     stored_results = [raw_result, fused_result, repaired_result, normalized_result]
     analyses = [
         analyse_result_from_ranges(result, ranges, duration, args, audio_path)
@@ -2734,6 +3286,15 @@ def analyse_file(
         write_click_track(
             file_output / f"{stem}__{result.method}__clicks.wav", y, sr, result
         )
+    preview_result = (
+        phase_result if args.grid_mode != "phase-aware" else legacy_result
+    )
+    write_click_track(
+        file_output / f"{stem}__{preview_result.method}__clicks.wav",
+        y,
+        sr,
+        preview_result,
+    )
 
     write_plot(
         file_output / f"{stem}__tempo.png",
@@ -2768,6 +3329,15 @@ def analyse_file(
         duration,
         blocked_ranges,
     )
+    write_phase_grid_comparison_plot(
+        file_output / f"{stem}__beat-this__grid-comparison.png",
+        audio_path.name,
+        legacy_result,
+        phase_result,
+        grid_transitions,
+        duration,
+        blocked_ranges,
+    )
     write_grid_plot(
         file_output / f"{stem}__grid.png",
         audio_path.name,
@@ -2792,6 +3362,22 @@ def analyse_file(
     normalized_grid_bpm = (
         np.concatenate(normalized_grid_bpm_parts)
         if normalized_grid_bpm_parts
+        else np.asarray([], dtype=float)
+    )
+    phase_grid_bpm_parts: list[np.ndarray] = []
+    for range_index, (start, end) in enumerate(ranges):
+        is_last = range_index == len(ranges) - 1
+        mask = (phase_result.beat_times >= start) & (
+            (phase_result.beat_times <= end)
+            if is_last
+            else (phase_result.beat_times < end)
+        )
+        intervals = np.diff(phase_result.beat_times[mask])
+        if len(intervals):
+            phase_grid_bpm_parts.append(60.0 / intervals)
+    phase_grid_bpm = (
+        np.concatenate(phase_grid_bpm_parts)
+        if phase_grid_bpm_parts
         else np.asarray([], dtype=float)
     )
     scale_usage = []
@@ -2893,6 +3479,37 @@ def analyse_file(
                 "the saved repaired CSV as grid input."
             ),
         },
+        "p3c_phase_grid": {
+            "mode": args.grid_mode,
+            "official_normalization_source": selected_grid.method,
+            "legacy_beats_csv": paths["legacy_normalized"].name,
+            "phase_aware_beats_csv": paths["phase_normalized"].name,
+            "phase_grid_csv": paths["phase_events"].name,
+            "grid_transitions_csv": paths["grid_transitions"].name,
+            "phase_aware_beats": len(phase_result.beat_times),
+            "scale_switches": sum(
+                item.transition_type == "scale_switch"
+                for item in grid_transitions
+            ),
+            "phase_bridge_steps": sum(
+                item.transition_type == "phase_bridge"
+                for item in grid_transitions
+            ),
+            "used_scales": sorted(
+                {float(item.selected_scale) for item in phase_events}
+            ),
+            "intervals_outside_target": int(
+                np.sum(
+                    (phase_grid_bpm < NORMALIZED_BPM_MIN)
+                    | (phase_grid_bpm >= NORMALIZED_BPM_MAX)
+                )
+            ),
+            "note": (
+                "Preview keeps legacy as the official normalized output while "
+                "writing a phase-continuous alternative. Phase-aware mode "
+                "promotes the saved alternative to official normalized output."
+            ),
+        },
         "grid_normalization": {
             "target_bpm_interval": "[120, 240)",
             "candidate_scales": [float(scale) for scale in GRID_SCALES],
@@ -2914,6 +3531,7 @@ def analyse_file(
             "All plots and reports are regenerated from saved CSV data. "
             "NO_BEAT ranges are excluded from clicks, tempo statistics, and grid decoding. "
             f"P3-B repair mode is {args.repair_mode}. "
+            f"P3-C grid mode is {args.grid_mode}. "
             "Highlighted tempo-change regions are candidates, not ground truth. "
             "Exact 2x/0.5x tempo changes are musically ambiguous; raw BPM remains in each beat CSV."
         ),
@@ -2978,6 +3596,16 @@ def build_parser() -> argparse.ArgumentParser:
             "P3-B beat repair mode: off keeps fused beats; preview writes and "
             "auditions proposals without changing normalization (default); "
             "conservative feeds accepted repaired beats into normalization"
+        ),
+    )
+    parser.add_argument(
+        "--grid-mode",
+        choices=("legacy", "preview", "phase-aware"),
+        default="preview",
+        help=(
+            "P3-C grid mode: legacy keeps the old grid; preview writes a "
+            "phase-aware alternative while keeping legacy official (default); "
+            "phase-aware promotes the continuous-phase grid to normalized output"
         ),
     )
     return parser
