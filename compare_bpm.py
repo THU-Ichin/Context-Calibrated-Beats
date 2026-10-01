@@ -8,6 +8,10 @@ For every input file, this script writes the official raw and overlap-fused:
   * tempo and probability comparison plots;
   * a CSV summary and a JSON report of possible tempo-change regions.
 
+P3-A also writes interval diagnostics, repair candidates, and an unchanged
+"repaired" beat interface. These outputs are observational only: grid
+normalisation still consumes the saved overlap-fused beats.
+
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
 It corrects isolated likely missed/double beats and applies a short median filter;
@@ -117,6 +121,47 @@ class InferenceMetadata:
     sample_rate: int
     duration_seconds: float
     audio_path: str
+
+
+@dataclass
+class IntervalDiagnostic:
+    activity_segment_id: int
+    interval_index: int
+    left_beat_index: int
+    right_beat_index: int
+    start_seconds: float
+    end_seconds: float
+    midpoint_seconds: float
+    observed_interval_seconds: float
+    reference_interval_seconds: float
+    relative_deviation: float
+    acoustic_confidence: float
+    timing_confidence: float
+    local_stability: float
+    classification: str
+
+
+@dataclass
+class RepairCandidate:
+    candidate_id: int
+    activity_segment_id: int
+    candidate_type: str
+    start_seconds: float
+    end_seconds: float
+    affected_beat_index: int
+    observed_interval_seconds: float | None
+    reference_interval_seconds: float | None
+    relative_deviation: float | None
+    beat_probability: float | None
+    downbeat_probability: float | None
+    future_stability: float | None
+    phase_residual_before: float | None
+    phase_residual_after: float | None
+    proposed_action: str
+    candidate_confidence: float
+    protected_reason: str
+    proposed_times: str
+    diagnostic_note: str
 
 
 class BeatThisEstimator:
@@ -272,6 +317,371 @@ def local_tempo(beat_times: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     corrected[(ratio > 0.44) & (ratio < 0.58)] *= 2.0
     smooth = median_filter(corrected, size=window, mode="nearest")
     return midpoints, raw, smooth
+
+
+def _probability_near(
+    time_seconds: float,
+    logits: np.ndarray,
+    fps: float,
+    radius_seconds: float = 0.08,
+) -> float:
+    if not len(logits):
+        return 0.0
+    centre = int(round(time_seconds * fps))
+    radius = max(0, int(round(radius_seconds * fps)))
+    start = max(0, centre - radius)
+    end = min(len(logits), centre + radius + 1)
+    if start >= end:
+        return 0.0
+    return float(np.max(expit(logits[start:end])))
+
+
+def _robust_stability(values: np.ndarray) -> float:
+    """Return a 0..1 score; one means a locally constant beat period."""
+    values = np.asarray(values, dtype=float)
+    if not len(values):
+        return 0.0
+    median = float(np.median(values))
+    if median <= 1e-9:
+        return 0.0
+    relative_mad = 1.4826 * float(np.median(np.abs(values - median))) / median
+    return float(np.clip(1.0 - relative_mad / 0.10, 0.0, 1.0))
+
+
+def diagnose_fused_beats(
+    fused_result: BeatResult,
+    frames: FramePredictions,
+    ranges: list[tuple[float, float]],
+) -> tuple[list[IntervalDiagnostic], list[RepairCandidate]]:
+    """Describe possible beat errors without changing any beat timestamps."""
+    all_times = np.asarray(fused_result.beat_times, dtype=float)
+    diagnostics: list[IntervalDiagnostic] = []
+    candidates: list[RepairCandidate] = []
+
+    def add_candidate(**kwargs) -> None:
+        candidates.append(RepairCandidate(candidate_id=len(candidates) + 1, **kwargs))
+
+    for segment_id, (range_start, range_end) in enumerate(ranges):
+        is_last = segment_id == len(ranges) - 1
+        mask = (all_times >= range_start) & (
+            (all_times <= range_end) if is_last else (all_times < range_end)
+        )
+        global_indices = np.flatnonzero(mask)
+        times = all_times[mask]
+        if len(times) < 2:
+            continue
+        intervals = np.diff(times)
+        references = np.empty_like(intervals)
+        stabilities = np.empty_like(intervals)
+        for index in range(len(intervals)):
+            left = max(0, index - 4)
+            right = min(len(intervals), index + 5)
+            neighbours = np.delete(intervals[left:right], index - left)
+            if not len(neighbours):
+                neighbours = intervals[left:right]
+            references[index] = float(np.median(neighbours))
+            stabilities[index] = _robust_stability(neighbours)
+
+        deviations = np.divide(
+            np.abs(intervals - references),
+            references,
+            out=np.zeros_like(intervals),
+            where=references > 1e-9,
+        )
+
+        # Protect smooth, persistent period motion. It is evidence of rubato or a
+        # real tempo transition, not an isolated beat error.
+        protected = np.zeros(len(intervals), dtype=bool)
+        if len(intervals) >= 4:
+            log_period = np.log(np.maximum(intervals, 1e-9))
+            for start in range(len(intervals) - 3):
+                window = log_period[start : start + 4]
+                deltas = np.diff(window)
+                same_direction = bool(
+                    np.all(deltas >= -0.015) or np.all(deltas <= 0.015)
+                )
+                gradual_steps = bool(np.all(np.abs(deltas) <= 0.16))
+                total_motion = abs(float(np.exp(window[-1] - window[0]) - 1.0))
+                if same_direction and gradual_steps and total_motion >= 0.12:
+                    protected[start : start + 4] = True
+
+        for index, (interval, reference, deviation) in enumerate(
+            zip(intervals, references, deviations)
+        ):
+            midpoint = float((times[index] + times[index + 1]) / 2.0)
+            acoustic = 0.5 * (
+                _probability_near(
+                    float(times[index]), frames.fused_beat_logits, frames.fps, 0.02
+                )
+                + _probability_near(
+                    float(times[index + 1]),
+                    frames.fused_beat_logits,
+                    frames.fps,
+                    0.02,
+                )
+            )
+            timing = float(np.exp(-max(0.0, float(deviation) - 0.10) / 0.15))
+            if protected[index]:
+                classification = "protected_tempo_motion"
+            elif deviation <= 0.10:
+                classification = "normal"
+            elif deviation <= 0.15:
+                classification = "observe"
+            elif deviation <= 0.25:
+                classification = "structural_evidence_required"
+            else:
+                classification = "strong_outlier"
+            diagnostics.append(
+                IntervalDiagnostic(
+                    activity_segment_id=segment_id,
+                    interval_index=index + 1,
+                    left_beat_index=int(global_indices[index]) + 1,
+                    right_beat_index=int(global_indices[index + 1]) + 1,
+                    start_seconds=float(times[index]),
+                    end_seconds=float(times[index + 1]),
+                    midpoint_seconds=midpoint,
+                    observed_interval_seconds=float(interval),
+                    reference_interval_seconds=float(reference),
+                    relative_deviation=float(deviation),
+                    acoustic_confidence=float(acoustic),
+                    timing_confidence=timing,
+                    local_stability=float(stabilities[index]),
+                    classification=classification,
+                )
+            )
+
+        # Long intervals close to an integer number of local periods imply
+        # missing beats. A candidate still requires stable timing context.
+        for index, (interval, reference, deviation) in enumerate(
+            zip(intervals, references, deviations)
+        ):
+            if protected[index] or deviation <= 0.15 or reference <= 1e-9:
+                continue
+            ratio = float(interval / reference)
+            multiple = int(round(ratio))
+            if multiple < 2 or multiple > 4 or abs(ratio - multiple) > 0.15 * multiple:
+                continue
+            proposed = [
+                float(times[index] + interval * part / multiple)
+                for part in range(1, multiple)
+            ]
+            evidence = float(
+                np.mean(
+                    [
+                        _probability_near(
+                            item, frames.fused_beat_logits, frames.fps
+                        )
+                        for item in proposed
+                    ]
+                )
+            )
+            closeness = 1.0 - abs(ratio - multiple) / (0.15 * multiple)
+            confidence = float(
+                np.clip(
+                    0.50 * closeness
+                    + 0.30 * evidence
+                    + 0.20 * stabilities[index],
+                    0.0,
+                    1.0,
+                )
+            )
+            add_candidate(
+                activity_segment_id=segment_id,
+                candidate_type="missing_beat",
+                start_seconds=float(times[index]),
+                end_seconds=float(times[index + 1]),
+                affected_beat_index=int(global_indices[index + 1]) + 1,
+                observed_interval_seconds=float(interval),
+                reference_interval_seconds=float(reference),
+                relative_deviation=float(deviation),
+                beat_probability=evidence,
+                downbeat_probability=max(
+                    (
+                        _probability_near(
+                            item, frames.fused_downbeat_logits, frames.fps
+                        )
+                        for item in proposed
+                    ),
+                    default=0.0,
+                ),
+                future_stability=None,
+                phase_residual_before=None,
+                phase_residual_after=None,
+                proposed_action="insert",
+                candidate_confidence=confidence,
+                protected_reason="",
+                proposed_times=";".join(f"{item:.9f}" for item in proposed),
+                diagnostic_note=f"Long interval is close to {multiple} local periods",
+            )
+
+        # Two adjacent short intervals whose sum restores the local period imply
+        # a possible extra beat at their boundary.
+        for beat_index in range(1, len(times) - 1):
+            left_interval = float(intervals[beat_index - 1])
+            right_interval = float(intervals[beat_index])
+            reference = float(
+                np.median([references[beat_index - 1], references[beat_index]])
+            )
+            if reference <= 1e-9 or protected[beat_index - 1] or protected[beat_index]:
+                continue
+            merged = left_interval + right_interval
+            deviation = abs(merged - reference) / reference
+            if (
+                deviation > 0.15
+                or left_interval >= 0.75 * reference
+                or right_interval >= 0.75 * reference
+            ):
+                continue
+            beat_probability = _probability_near(
+                float(times[beat_index]),
+                frames.fused_beat_logits,
+                frames.fps,
+                0.02,
+            )
+            stability = min(stabilities[beat_index - 1], stabilities[beat_index])
+            confidence = float(
+                np.clip(
+                    0.55 * (1.0 - deviation / 0.15)
+                    + 0.25 * (1.0 - beat_probability)
+                    + 0.20 * stability,
+                    0.0,
+                    1.0,
+                )
+            )
+            add_candidate(
+                activity_segment_id=segment_id,
+                candidate_type="extra_beat",
+                start_seconds=float(times[beat_index - 1]),
+                end_seconds=float(times[beat_index + 1]),
+                affected_beat_index=int(global_indices[beat_index]) + 1,
+                observed_interval_seconds=merged,
+                reference_interval_seconds=reference,
+                relative_deviation=float(deviation),
+                beat_probability=beat_probability,
+                downbeat_probability=_probability_near(
+                    float(times[beat_index]),
+                    frames.fused_downbeat_logits,
+                    frames.fps,
+                    0.02,
+                ),
+                future_stability=None,
+                phase_residual_before=None,
+                phase_residual_after=None,
+                proposed_action="remove",
+                candidate_confidence=confidence,
+                protected_reason="",
+                proposed_times="",
+                diagnostic_note="Two short intervals merge to one local period",
+            )
+
+        # Find the first genuinely stable 4--5 second future window and use its
+        # phase only to diagnose an unstable prefix/re-entry.
+        stable_window: tuple[int, int, float, float] | None = None
+        for start in range(len(intervals)):
+            for stop in range(start + 4, len(intervals) + 1):
+                span = float(np.sum(intervals[start:stop]))
+                if span < 4.0:
+                    continue
+                if span > 5.2:
+                    break
+                window = intervals[start:stop]
+                period = float(np.median(window))
+                max_deviation = float(np.max(np.abs(window - period) / period))
+                stability = _robust_stability(window)
+                if max_deviation <= 0.10 and stability >= 0.65:
+                    stable_window = (start, stop, period, stability)
+                    break
+            if stable_window is not None:
+                break
+        if stable_window is not None:
+            stable_start, _, period, future_stability = stable_window
+            prefix = times[: stable_start + 1]
+            if len(prefix) >= 2 and period > 1e-9:
+                anchor = float(times[stable_start])
+                grid_steps = np.rint((prefix - anchor) / period)
+                projected = anchor + grid_steps * period
+                signed = prefix - projected
+                before = float(np.median(np.abs(signed)))
+                coherent = abs(float(np.median(signed))) >= 0.08 * period
+                if before >= 0.12 * period and coherent:
+                    confidence = float(
+                        np.clip(
+                            0.65 * min(1.0, before / (0.25 * period))
+                            + 0.35 * future_stability,
+                            0.0,
+                            1.0,
+                        )
+                    )
+                    add_candidate(
+                        activity_segment_id=segment_id,
+                        candidate_type="phase_prefix",
+                        start_seconds=float(prefix[0]),
+                        end_seconds=float(prefix[-1]),
+                        affected_beat_index=int(global_indices[0]) + 1,
+                        observed_interval_seconds=None,
+                        reference_interval_seconds=period,
+                        relative_deviation=before / period,
+                        beat_probability=float(
+                            np.mean(
+                                [
+                                    _probability_near(
+                                        item,
+                                        frames.fused_beat_logits,
+                                        frames.fps,
+                                        0.02,
+                                    )
+                                    for item in prefix
+                                ]
+                            )
+                        ),
+                        downbeat_probability=None,
+                        future_stability=future_stability,
+                        phase_residual_before=before,
+                        phase_residual_after=0.0,
+                        proposed_action="shift_phase",
+                        candidate_confidence=confidence,
+                        protected_reason="diagnostic_only",
+                        proposed_times=";".join(
+                            f"{item:.9f}" for item in projected
+                        ),
+                        diagnostic_note=(
+                            "Stable future grid suggests a coherent phase offset "
+                            "in the preceding beats"
+                        ),
+                    )
+
+        # Surface protected motion as an explicit non-repair event.
+        protected_indices = np.flatnonzero(protected)
+        if len(protected_indices):
+            for run in np.split(
+                protected_indices,
+                np.flatnonzero(np.diff(protected_indices) > 1) + 1,
+            ):
+                if not len(run):
+                    continue
+                start = int(run[0])
+                stop = int(run[-1])
+                add_candidate(
+                    activity_segment_id=segment_id,
+                    candidate_type="tempo_motion",
+                    start_seconds=float(times[start]),
+                    end_seconds=float(times[stop + 1]),
+                    affected_beat_index=int(global_indices[start]) + 1,
+                    observed_interval_seconds=float(np.median(intervals[run])),
+                    reference_interval_seconds=float(np.median(references[run])),
+                    relative_deviation=float(np.max(deviations[run])),
+                    beat_probability=None,
+                    downbeat_probability=None,
+                    future_stability=None,
+                    phase_residual_before=None,
+                    phase_residual_after=None,
+                    proposed_action="protect_tempo_change",
+                    candidate_confidence=float(np.mean(stabilities[run])),
+                    protected_reason="smooth_persistent_period_motion",
+                    proposed_times="",
+                    diagnostic_note="Do not treat this smooth period motion as a spike",
+                )
+    return diagnostics, candidates
 
 
 NORMALIZED_BPM_MIN = 120.0
@@ -1151,6 +1561,151 @@ def read_beats_csv(path: Path, method: str, note: str = "") -> BeatResult:
     )
 
 
+def _optional_number(value: float | None, digits: int = 6) -> str:
+    return "" if value is None else f"{value:.{digits}f}"
+
+
+def write_interval_diagnostics_csv(
+    path: Path, diagnostics: list[IntervalDiagnostic]
+) -> None:
+    fieldnames = list(IntervalDiagnostic.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in diagnostics:
+            row = asdict(item)
+            for field in (
+                "start_seconds",
+                "end_seconds",
+                "midpoint_seconds",
+                "observed_interval_seconds",
+                "reference_interval_seconds",
+            ):
+                row[field] = f"{row[field]:.9f}"
+            for field in (
+                "relative_deviation",
+                "acoustic_confidence",
+                "timing_confidence",
+                "local_stability",
+            ):
+                row[field] = f"{row[field]:.6f}"
+            writer.writerow(row)
+
+
+def read_interval_diagnostics_csv(path: Path) -> list[IntervalDiagnostic]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return [
+        IntervalDiagnostic(
+            activity_segment_id=int(row["activity_segment_id"]),
+            interval_index=int(row["interval_index"]),
+            left_beat_index=int(row["left_beat_index"]),
+            right_beat_index=int(row["right_beat_index"]),
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+            midpoint_seconds=float(row["midpoint_seconds"]),
+            observed_interval_seconds=float(row["observed_interval_seconds"]),
+            reference_interval_seconds=float(row["reference_interval_seconds"]),
+            relative_deviation=float(row["relative_deviation"]),
+            acoustic_confidence=float(row["acoustic_confidence"]),
+            timing_confidence=float(row["timing_confidence"]),
+            local_stability=float(row["local_stability"]),
+            classification=row["classification"],
+        )
+        for row in rows
+    ]
+
+
+def write_repair_candidates_csv(
+    path: Path, candidates: list[RepairCandidate]
+) -> None:
+    fieldnames = list(RepairCandidate.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in candidates:
+            row = asdict(item)
+            for field in (
+                "start_seconds",
+                "end_seconds",
+                "observed_interval_seconds",
+                "reference_interval_seconds",
+                "phase_residual_before",
+                "phase_residual_after",
+            ):
+                row[field] = _optional_number(row[field], 9)
+            for field in (
+                "relative_deviation",
+                "beat_probability",
+                "downbeat_probability",
+                "future_stability",
+                "candidate_confidence",
+            ):
+                row[field] = _optional_number(row[field], 6)
+            writer.writerow(row)
+
+
+def read_repair_candidates_csv(path: Path) -> list[RepairCandidate]:
+    def optional(row: dict[str, str], field: str) -> float | None:
+        value = row.get(field, "")
+        return float(value) if value not in {None, ""} else None
+
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return [
+        RepairCandidate(
+            candidate_id=int(row["candidate_id"]),
+            activity_segment_id=int(row["activity_segment_id"]),
+            candidate_type=row["candidate_type"],
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+            affected_beat_index=int(row["affected_beat_index"]),
+            observed_interval_seconds=optional(row, "observed_interval_seconds"),
+            reference_interval_seconds=optional(row, "reference_interval_seconds"),
+            relative_deviation=optional(row, "relative_deviation"),
+            beat_probability=optional(row, "beat_probability"),
+            downbeat_probability=optional(row, "downbeat_probability"),
+            future_stability=optional(row, "future_stability"),
+            phase_residual_before=optional(row, "phase_residual_before"),
+            phase_residual_after=optional(row, "phase_residual_after"),
+            proposed_action=row["proposed_action"],
+            candidate_confidence=float(row["candidate_confidence"]),
+            protected_reason=row["protected_reason"],
+            proposed_times=row["proposed_times"],
+            diagnostic_note=row["diagnostic_note"],
+        )
+        for row in rows
+    ]
+
+
+def write_diagnostic_repaired_beats_csv(source_path: Path, path: Path) -> None:
+    """Write P3-A's unchanged repair interface from the saved fused CSV."""
+    with source_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        source_fields = list(reader.fieldnames or [])
+    extra_fields = [
+        "original_time_seconds",
+        "repaired_time_seconds",
+        "repair_action",
+        "repair_candidate_id",
+    ]
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=source_fields + extra_fields)
+        writer.writeheader()
+        for row in rows:
+            time_seconds = row["beat_time_seconds"]
+            row.update(
+                {
+                    "original_time_seconds": time_seconds,
+                    "repaired_time_seconds": time_seconds,
+                    "repair_action": "none",
+                    "repair_candidate_id": "",
+                }
+            )
+            writer.writerow(row)
+
+
 def write_click_track(path: Path, y: np.ndarray, sr: int, result: BeatResult) -> None:
     clicks = librosa.clicks(
         times=result.beat_times,
@@ -1274,6 +1829,139 @@ def write_probability_plot(
     plt.close(fig)
 
 
+def write_diagnostics_plot(
+    path: Path,
+    title: str,
+    frames: FramePredictions,
+    fused_result: BeatResult,
+    diagnostics: list[IntervalDiagnostic],
+    candidates: list[RepairCandidate],
+    duration: float,
+    blocked_ranges: list[tuple[float, float]],
+) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9.2), sharex=True)
+    frame_times = np.arange(len(frames.fused_beat_logits), dtype=float) / frames.fps
+    beat_probability = expit(frames.fused_beat_logits)
+    axes[0].plot(
+        frame_times,
+        beat_probability,
+        color="tab:blue",
+        linewidth=0.7,
+        alpha=0.8,
+        label="fused beat probability",
+    )
+    if len(fused_result.beat_times):
+        beat_values = [
+            _probability_near(
+                float(item), frames.fused_beat_logits, frames.fps, 0.02
+            )
+            for item in fused_result.beat_times
+        ]
+        axes[0].scatter(
+            fused_result.beat_times,
+            beat_values,
+            color="black",
+            s=8,
+            alpha=0.65,
+            label="detected fused beats",
+        )
+    axes[0].set_ylim(-0.02, 1.02)
+    axes[0].set_ylabel("Probability")
+
+    if diagnostics:
+        midpoint = np.asarray([item.midpoint_seconds for item in diagnostics])
+        observed_bpm = 60.0 / np.asarray(
+            [item.observed_interval_seconds for item in diagnostics]
+        )
+        reference_bpm = 60.0 / np.asarray(
+            [item.reference_interval_seconds for item in diagnostics]
+        )
+        deviation = 100.0 * np.asarray(
+            [item.relative_deviation for item in diagnostics]
+        )
+        axes[1].scatter(
+            midpoint,
+            observed_bpm,
+            s=9,
+            alpha=0.35,
+            label="observed interval BPM",
+        )
+        axes[1].plot(
+            midpoint,
+            reference_bpm,
+            color="black",
+            linewidth=1.1,
+            label="local reference BPM",
+        )
+        axes[1].fill_between(
+            midpoint,
+            reference_bpm / 1.10,
+            reference_bpm / 0.90,
+            color="tab:green",
+            alpha=0.10,
+            label="10% period deadband",
+        )
+        axes[2].plot(
+            midpoint,
+            deviation,
+            color="tab:blue",
+            linewidth=0.8,
+            alpha=0.75,
+            label="interval deviation",
+        )
+    for threshold, style in ((10.0, "--"), (15.0, ":"), (25.0, "-.")):
+        axes[2].axhline(
+            threshold,
+            color="black",
+            linestyle=style,
+            linewidth=0.8,
+            alpha=0.65,
+            label=f"{threshold:g}%" if threshold == 10.0 else None,
+        )
+
+    colours = {
+        "missing_beat": "tab:red",
+        "extra_beat": "tab:orange",
+        "phase_prefix": "tab:purple",
+        "tempo_motion": "tab:green",
+    }
+    shown: set[str] = set()
+    for candidate in candidates:
+        colour = colours.get(candidate.candidate_type, "tab:gray")
+        label = (
+            candidate.candidate_type
+            if candidate.candidate_type not in shown
+            else None
+        )
+        shown.add(candidate.candidate_type)
+        axes[2].axvspan(
+            candidate.start_seconds,
+            candidate.end_seconds,
+            color=colour,
+            alpha=0.14,
+            label=label,
+        )
+    for ax in axes:
+        for blocked_index, (start, end) in enumerate(blocked_ranges):
+            ax.axvspan(
+                start,
+                end,
+                color="0.5",
+                alpha=0.16,
+                label="NO_BEAT" if blocked_index == 0 else None,
+            )
+        ax.set_xlim(0, duration)
+        ax.grid(alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[1].set_ylabel("BPM")
+    axes[2].set_ylabel("Deviation (%)")
+    axes[2].set_xlabel("Time (seconds)")
+    fig.suptitle(f"{title} — P3-A beat diagnostics (no repairs applied)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def write_grid_plot(
     path: Path,
     title: str,
@@ -1375,6 +2063,9 @@ def analyse_file(
         "frames": file_output / f"{stem}__beat-this__frames.csv",
         "raw": file_output / f"{stem}__beat-this-raw__beats.csv",
         "fused": file_output / f"{stem}__beat-this-fused__beats.csv",
+        "repaired": file_output / f"{stem}__beat-this-repaired__beats.csv",
+        "diagnostics": file_output / f"{stem}__beat-this__diagnostics.csv",
+        "repairs": file_output / f"{stem}__beat-this__repairs.csv",
         "normalized": file_output / f"{stem}__beat-this-normalized__beats.csv",
         "grid": file_output / f"{stem}__beat-this__grid.csv",
     }
@@ -1462,6 +2153,19 @@ def analyse_file(
         )
     raw_result = read_beats_csv(paths["raw"], "beat-this-raw", raw_note)
     fused_result = read_beats_csv(paths["fused"], "beat-this-fused", fused_note)
+    interval_diagnostics, repair_candidates = diagnose_fused_beats(
+        fused_result,
+        frames,
+        ranges,
+    )
+    write_interval_diagnostics_csv(paths["diagnostics"], interval_diagnostics)
+    write_repair_candidates_csv(paths["repairs"], repair_candidates)
+    write_diagnostic_repaired_beats_csv(paths["fused"], paths["repaired"])
+
+    # Diagnostic plots and reports also consume the saved CSV representation.
+    interval_diagnostics = read_interval_diagnostics_csv(paths["diagnostics"])
+    repair_candidates = read_repair_candidates_csv(paths["repairs"])
+    # P3-A deliberately continues to normalize the unmodified fused result.
     normalized_result, grid_decoding = build_normalized_grid(
         fused_result,
         frames,
@@ -1510,6 +2214,16 @@ def analyse_file(
         file_output / f"{stem}__probabilities.png",
         audio_path.name,
         frames,
+        duration,
+        blocked_ranges,
+    )
+    write_diagnostics_plot(
+        file_output / f"{stem}__beat-this__diagnostics.png",
+        audio_path.name,
+        frames,
+        fused_result,
+        interval_diagnostics,
+        repair_candidates,
         duration,
         blocked_ranges,
     )
@@ -1580,6 +2294,29 @@ def analyse_file(
             "hop_seconds": frames.hop_seconds,
             "overlap_windows": frames.overlap_windows,
             "aggregation": "Hann-weighted logit mean",
+        },
+        "p3a_diagnostics": {
+            "diagnostics_csv": paths["diagnostics"].name,
+            "repair_candidates_csv": paths["repairs"].name,
+            "repaired_interface_csv": paths["repaired"].name,
+            "repairs_applied": 0,
+            "intervals": len(interval_diagnostics),
+            "candidate_counts": {
+                candidate_type: sum(
+                    item.candidate_type == candidate_type
+                    for item in repair_candidates
+                )
+                for candidate_type in (
+                    "missing_beat",
+                    "extra_beat",
+                    "phase_prefix",
+                    "tempo_motion",
+                )
+            },
+            "note": (
+                "P3-A is diagnostic only. The repaired beat CSV is an unchanged "
+                "copy interface, and normalization still consumes fused beats."
+            ),
         },
         "grid_normalization": {
             "target_bpm_interval": "[120, 240)",

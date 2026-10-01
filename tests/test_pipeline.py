@@ -119,6 +119,57 @@ class CsvPipelineTest(unittest.TestCase):
             loaded_beats.beat_times, normalized.beat_times, atol=1e-9
         )
 
+    def test_p3a_diagnostics_do_not_modify_fused_beats(self) -> None:
+        beat_times = np.asarray([0.0, 0.7, 1.4, 2.8, 3.5, 4.2, 4.9, 5.6])
+        result = bpm.BeatResult("beat-this-fused", beat_times)
+        diagnostics, candidates = bpm.diagnose_fused_beats(
+            result, self.frames, [(0.0, 6.0)]
+        )
+
+        self.assertEqual(len(diagnostics), len(beat_times) - 1)
+        self.assertTrue(
+            any(item.candidate_type == "missing_beat" for item in candidates)
+        )
+        np.testing.assert_array_equal(result.beat_times, beat_times)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fused.csv"
+            repaired = root / "repaired.csv"
+            mids, raw, smooth = bpm.local_tempo(result.beat_times)
+            bpm.write_beats_csv(
+                source, result, mids, raw, smooth, 22050, [(0.0, 6.0)]
+            )
+            bpm.write_diagnostic_repaired_beats_csv(source, repaired)
+            loaded = bpm.read_beats_csv(repaired, "beat-this-repaired")
+
+        np.testing.assert_array_equal(loaded.beat_times, beat_times)
+
+    def test_p3a_detects_extra_beat_and_protects_smooth_motion(self) -> None:
+        extra_times = np.asarray([0.0, 0.7, 1.05, 1.4, 2.1, 2.8, 3.5, 4.2])
+        _, extra_candidates = bpm.diagnose_fused_beats(
+            bpm.BeatResult("beat-this-fused", extra_times),
+            self.frames,
+            [(0.0, 5.0)],
+        )
+        self.assertTrue(
+            any(item.candidate_type == "extra_beat" for item in extra_candidates)
+        )
+
+        periods = np.asarray([0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.70])
+        motion_times = np.concatenate(([0.0], np.cumsum(periods)))
+        diagnostics, motion_candidates = bpm.diagnose_fused_beats(
+            bpm.BeatResult("beat-this-fused", motion_times),
+            self.frames,
+            [(0.0, 5.0)],
+        )
+        self.assertTrue(
+            any(item.classification == "protected_tempo_motion" for item in diagnostics)
+        )
+        self.assertTrue(
+            any(item.candidate_type == "tempo_motion" for item in motion_candidates)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
