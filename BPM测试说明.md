@@ -5,6 +5,8 @@
 并使用重叠窗口融合逐帧 logits，以减少约 30 秒分块处的硬接缝。
 融合结果随后进入五层网格解码器，在 `0.25x / 0.5x / 1x / 2x / 4x`
 候选中选择路径，并将最终 click 网格归一化到 `[120, 240)` BPM。
+推理产生的基础数据会先保存到 CSV，再从 CSV 重载并生成归一化结果、统计、
+click-track 和图片，避免落盘数据与绘图数据来自不同处理阶段。
 
 `librosa` 只用于音频读取、时长计算、click 合成和归一化，不再参与节拍检测。
 
@@ -56,6 +58,39 @@ python compare_bpm.py "D:\Music\song.mp3" -o bpm_results --min-bpm 70 --max-bpm 
 python compare_bpm.py "audio\Reply.mp3" -o bpm_results --beat-this-hop-seconds 5
 ```
 
+首次运行后，每首歌目录会生成可编辑的 `__segments.csv`。修改其中的
+`NO_BEAT` 区段后，可以复用已经保存的 Beat This! 推理结果快速重建派生文件：
+
+```powershell
+python compare_bpm.py "audio\Reply.mp3" -o bpm_results --reuse-inference
+```
+
+该模式不会重新运行模型，但会重新生成 normalized CSV、三套 click、图片、
+报告和汇总。音频路径、输出目录和歌曲文件名必须与首次运行一致。
+
+## 标注 NO_BEAT
+
+`__segments.csv` 默认包含一行覆盖全曲的 `no_beat=0`。用户可以追加
+`no_beat=1` 的区段；这些行优先于默认行，例如：
+
+```csv
+segment_id,start_seconds,end_seconds,no_beat,source,note
+0,0.000000000,238.957000000,0,default,
+1,0.000000000,17.600000000,1,user,清唱前奏
+2,208.600000000,238.957000000,1,user,自由速度尾奏
+```
+
+区间采用 `[start_seconds, end_seconds)` 语义。重处理后，`NO_BEAT` 区段：
+
+- 不输出 click；
+- 不参与主 BPM 和变速统计；
+- 不运行五档网格解码；
+- 不会跨越区段补拍；
+- 在图片中以灰色阴影显示。
+
+因此 `[120, 240)` 约束只适用于每个有效节拍区段内部，不适用于跨越
+`NO_BEAT` 空白的时间差。
+
 ## 输出怎么看
 
 每首歌有一个独立子目录，其中包含：
@@ -66,11 +101,18 @@ python compare_bpm.py "audio\Reply.mp3" -o bpm_results --beat-this-hop-seconds 5
 - 对应的 `__clicks.wav`：raw/fused/normalized 三套试听文件，高音点击代表 downbeat；
 - `__beat-this__frames.csv`：50 FPS 的 raw/fused beat、downbeat logits 和概率；
 - `__beat-this__grid.csv`：每个区间的基础 BPM、选中倍率、归一化 BPM 和置信度；
+- `__inference.csv`：FPS、窗口、hop、采样率和音频路径等推理元数据；
+- `__segments.csv`：用户或模型提供的有效节拍/`NO_BEAT` 时间段；
 - `__tempo.png`：raw/fused/normalized 三套拍点计算出的局部 BPM 对比；
 - `__probabilities.png`：raw/fused 逐帧 beat/downbeat 概率对比；
-- `__grid.png`：基础 BPM、归一化 BPM 和选中网格倍率；
+- `__grid.png`：基础 BPM、倍率决策 BPM、最终实际 BPM 和选中网格倍率；
 - `__report.json`：主导 BPM 和疑似变速区间；
-- 根目录 `summary.csv`：所有歌曲的 raw/fused 汇总。
+- 根目录 `summary.csv`：所有歌曲的 raw/fused/normalized 汇总，并包含有效时长和
+  `NO_BEAT` 时长。
+
+三套 beat CSV 都保存 `sample_index`、高精度时间、`activity_segment_id` 和
+`is_no_beat`。绘图与统计不读取 Python 推理内存，而是重新加载这些 CSV、
+`frames.csv`、`grid.csv` 和 `segments.csv` 后生成。
 
 判断好坏时，优先试听 normalized，并与 raw/fused 两套 `__clicks.wav` 做 A/B：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
 

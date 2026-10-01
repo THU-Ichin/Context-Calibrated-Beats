@@ -81,6 +81,7 @@ class FramePredictions:
 @dataclass
 class GridDecoding:
     interval_midpoints: np.ndarray
+    interval_durations: np.ndarray
     base_bpm: np.ndarray
     selected_scale: np.ndarray
     normalized_bpm: np.ndarray
@@ -95,6 +96,27 @@ class TempoRegion:
     median_bpm: float
     difference_from_main_bpm: float
     beat_intervals: int
+
+
+@dataclass
+class ActivitySegment:
+    segment_id: int
+    start_seconds: float
+    end_seconds: float
+    no_beat: bool
+    source: str = "default"
+    note: str = ""
+
+
+@dataclass
+class InferenceMetadata:
+    fps: float
+    window_seconds: float
+    hop_seconds: float
+    overlap_windows: int
+    sample_rate: int
+    duration_seconds: float
+    audio_path: str
 
 
 class BeatThisEstimator:
@@ -318,12 +340,12 @@ def _frame_index(time_seconds: float, frames: FramePredictions) -> int:
     )
 
 
-def build_normalized_grid(
+def _build_normalized_grid_segment(
     fused_result: BeatResult,
     frames: FramePredictions,
     snap_radius_seconds: float = 0.08,
 ) -> tuple[BeatResult, GridDecoding]:
-    """Build a normalized beat grid from the selected metrical-level path."""
+    """Build a normalized grid for one contiguous beat-active segment."""
     beat_times = np.asarray(fused_result.beat_times, dtype=float)
     midpoints, _, base_bpm = local_tempo(beat_times)
     if len(beat_times) < 2 or not len(base_bpm):
@@ -335,7 +357,7 @@ def build_normalized_grid(
                 downbeat_times=np.asarray([], dtype=float),
                 note="Insufficient beats for metrical-level normalization",
             ),
-            GridDecoding(empty, empty, empty, empty, empty, empty),
+            GridDecoding(empty, empty, empty, empty, empty, empty, empty),
         )
 
     states, confidence = decode_grid_scales(base_bpm)
@@ -481,6 +503,7 @@ def build_normalized_grid(
     )
     decoding = GridDecoding(
         interval_midpoints=midpoints,
+        interval_durations=np.diff(beat_times),
         base_bpm=base_bpm,
         selected_scale=selected_scale,
         normalized_bpm=normalized_bpm,
@@ -490,21 +513,134 @@ def build_normalized_grid(
     return result, decoding
 
 
-def modal_tempo(midpoints: np.ndarray, bpm: np.ndarray, min_bpm: float, max_bpm: float) -> float:
+def build_normalized_grid(
+    fused_result: BeatResult,
+    frames: FramePredictions,
+    active_ranges: list[tuple[float, float]],
+    snap_radius_seconds: float = 0.08,
+) -> tuple[BeatResult, GridDecoding]:
+    """Normalize each beat-active range independently without bridging gaps."""
+    normalized_results: list[BeatResult] = []
+    decodings: list[GridDecoding] = []
+    next_grid_segment = 0
+    beat_times = np.asarray(fused_result.beat_times, dtype=float)
+    downbeat_times = np.asarray(
+        fused_result.downbeat_times
+        if fused_result.downbeat_times is not None
+        else [],
+        dtype=float,
+    )
+
+    for range_index, (start, end) in enumerate(active_ranges):
+        is_last = range_index == len(active_ranges) - 1
+        beat_mask = (beat_times >= start) & (
+            (beat_times <= end) if is_last else (beat_times < end)
+        )
+        segment_beats = beat_times[beat_mask]
+        if len(segment_beats) < 2:
+            continue
+        downbeat_mask = (downbeat_times >= start) & (
+            (downbeat_times <= end) if is_last else (downbeat_times < end)
+        )
+        segment_result = BeatResult(
+            method=fused_result.method,
+            beat_times=segment_beats,
+            downbeat_times=downbeat_times[downbeat_mask],
+            note=fused_result.note,
+        )
+        normalized, decoding = _build_normalized_grid_segment(
+            segment_result,
+            frames,
+            snap_radius_seconds=snap_radius_seconds,
+        )
+        if len(decoding.segment_id):
+            decoding.segment_id = decoding.segment_id + next_grid_segment
+            next_grid_segment = int(decoding.segment_id[-1]) + 1
+        normalized_results.append(normalized)
+        decodings.append(decoding)
+
+    empty = np.asarray([], dtype=float)
+    if not normalized_results:
+        return (
+            BeatResult(
+                method="beat-this-normalized",
+                beat_times=empty,
+                downbeat_times=empty,
+                note="No beat-active segment contained enough beats",
+            ),
+            GridDecoding(empty, empty, empty, empty, empty, empty, empty),
+        )
+
+    corrected_beats = np.unique(
+        np.concatenate([result.beat_times for result in normalized_results])
+    )
+    corrected_downbeats = np.unique(
+        np.concatenate(
+            [
+                result.downbeat_times
+                for result in normalized_results
+                if result.downbeat_times is not None
+                and len(result.downbeat_times)
+            ]
+        )
+        if any(
+            result.downbeat_times is not None and len(result.downbeat_times)
+            for result in normalized_results
+        )
+        else empty
+    )
+    result = BeatResult(
+        method="beat-this-normalized",
+        beat_times=corrected_beats,
+        downbeat_times=corrected_downbeats,
+        note=(
+            "Offline [120, 240) BPM normalization over "
+            "0.25x/0.5x/1x/2x/4x metrical grids within beat-active segments"
+        ),
+    )
+    decoding = GridDecoding(
+        interval_midpoints=np.concatenate(
+            [item.interval_midpoints for item in decodings]
+        ),
+        interval_durations=np.concatenate(
+            [item.interval_durations for item in decodings]
+        ),
+        base_bpm=np.concatenate([item.base_bpm for item in decodings]),
+        selected_scale=np.concatenate(
+            [item.selected_scale for item in decodings]
+        ),
+        normalized_bpm=np.concatenate(
+            [item.normalized_bpm for item in decodings]
+        ),
+        confidence=np.concatenate([item.confidence for item in decodings]),
+        segment_id=np.concatenate([item.segment_id for item in decodings]),
+    )
+    return result, decoding
+
+
+def modal_tempo(
+    midpoints: np.ndarray,
+    bpm: np.ndarray,
+    min_bpm: float,
+    max_bpm: float,
+    weights: np.ndarray | None = None,
+) -> float:
     """Find the time-weighted dominant tempo rather than merely the median."""
     valid = np.isfinite(bpm) & (bpm >= min_bpm) & (bpm <= max_bpm)
     if not np.any(valid):
         return math.nan
     values = bpm[valid]
     valid_times = midpoints[valid]
-    if len(valid_times) > 1:
+    if weights is not None:
+        histogram_weights = np.asarray(weights, dtype=float)[valid]
+    elif len(valid_times) > 1:
         weights = np.gradient(valid_times)
-        weights = np.clip(weights, 1e-3, None)
+        histogram_weights = np.clip(weights, 1e-3, None)
     else:
-        weights = np.ones_like(values)
+        histogram_weights = np.ones_like(values)
 
     edges = np.arange(math.floor(min_bpm), math.ceil(max_bpm) + 1.0, 1.0)
-    hist, _ = np.histogram(values, bins=edges, weights=weights)
+    hist, _ = np.histogram(values, bins=edges, weights=histogram_weights)
     hist = gaussian_filter1d(hist.astype(float), sigma=1.5)
     index = int(np.argmax(hist))
     return float((edges[index] + edges[index + 1]) / 2.0)
@@ -558,9 +694,230 @@ def detect_change_regions(
     return regions
 
 
+def analyse_result_from_ranges(
+    result: BeatResult,
+    ranges: list[tuple[float, float]],
+    duration: float,
+    args: argparse.Namespace,
+    audio_path: Path,
+) -> dict:
+    """Analyse only active ranges and insert NaNs so plots do not bridge gaps."""
+    pieces: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    beat_times = np.asarray(result.beat_times, dtype=float)
+    for index, (start, end) in enumerate(ranges):
+        is_last = index == len(ranges) - 1
+        mask = (beat_times >= start) & (
+            (beat_times <= end) if is_last else (beat_times < end)
+        )
+        segment_times = beat_times[mask]
+        midpoints, raw_bpm, smooth_bpm = local_tempo(segment_times)
+        if len(midpoints):
+            pieces.append(
+                (midpoints, raw_bpm, smooth_bpm, np.diff(segment_times))
+            )
+
+    if pieces:
+        modal_midpoints = np.concatenate([piece[0] for piece in pieces])
+        modal_bpm = np.concatenate([piece[2] for piece in pieces])
+        modal_weights = np.concatenate([piece[3] for piece in pieces])
+    else:
+        modal_midpoints = np.asarray([], dtype=float)
+        modal_bpm = np.asarray([], dtype=float)
+        modal_weights = np.asarray([], dtype=float)
+    main_bpm = modal_tempo(
+        modal_midpoints,
+        modal_bpm,
+        args.min_bpm,
+        args.max_bpm,
+        weights=modal_weights,
+    )
+    regions: list[TempoRegion] = []
+    for midpoints, _, smooth_bpm, _ in pieces:
+        regions.extend(
+            detect_change_regions(
+                midpoints,
+                smooth_bpm,
+                main_bpm,
+                relative_threshold=args.change_ratio,
+                absolute_threshold=args.change_bpm,
+                min_intervals=args.min_change_beats,
+                min_duration=args.min_change_seconds,
+            )
+        )
+
+    plot_midpoints: list[float] = []
+    plot_raw: list[float] = []
+    plot_smooth: list[float] = []
+    for piece_index, (midpoints, raw_bpm, smooth_bpm, _) in enumerate(pieces):
+        if piece_index:
+            plot_midpoints.append(float("nan"))
+            plot_raw.append(float("nan"))
+            plot_smooth.append(float("nan"))
+        plot_midpoints.extend(midpoints)
+        plot_raw.extend(raw_bpm)
+        plot_smooth.extend(smooth_bpm)
+
+    return {
+        "result": filter_result_to_ranges(result, ranges),
+        "midpoints": np.asarray(plot_midpoints, dtype=float),
+        "raw_bpm": np.asarray(plot_raw, dtype=float),
+        "smooth_bpm": np.asarray(plot_smooth, dtype=float),
+        "main_bpm": main_bpm,
+        "regions": regions,
+        "duration": duration,
+        "active_duration": sum(end - start for start, end in ranges),
+        "no_beat_duration": duration - sum(end - start for start, end in ranges),
+        "audio": audio_path,
+    }
+
+
 def safe_stem(path: Path) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", path.stem)
     return cleaned.strip(" ._") or "audio"
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n", ""}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+def ensure_segments_csv(path: Path, duration: float) -> None:
+    """Create an editable default activity map without overwriting user edits."""
+    if path.exists():
+        return
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "segment_id",
+                "start_seconds",
+                "end_seconds",
+                "no_beat",
+                "source",
+                "note",
+            ]
+        )
+        writer.writerow([0, "0.000000000", f"{duration:.9f}", 0, "default", ""])
+
+
+def read_segments_csv(path: Path, duration: float) -> list[ActivitySegment]:
+    """Read NO_BEAT annotations; true rows override uncovered/default rows."""
+    segments: list[ActivitySegment] = []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        for row_number, row in enumerate(csv.DictReader(handle), start=2):
+            try:
+                start = float(row["start_seconds"])
+                end = float(row["end_seconds"])
+                no_beat = _parse_bool(row.get("no_beat", "0"))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid segment row {row_number} in {path.name}: {exc}"
+                ) from exc
+            if not (0.0 <= start < end <= duration + 1e-6):
+                raise ValueError(
+                    f"Segment row {row_number} must satisfy "
+                    f"0 <= start < end <= {duration:.6f}"
+                )
+            segments.append(
+                ActivitySegment(
+                    segment_id=int(row.get("segment_id", len(segments))),
+                    start_seconds=max(0.0, start),
+                    end_seconds=min(duration, end),
+                    no_beat=no_beat,
+                    source=(row.get("source") or "user").strip(),
+                    note=(row.get("note") or "").strip(),
+                )
+            )
+    return segments
+
+
+def no_beat_ranges(
+    segments: list[ActivitySegment], duration: float
+) -> list[tuple[float, float]]:
+    """Return the merged union of user/model NO_BEAT ranges."""
+    blocked = sorted(
+        (
+            max(0.0, item.start_seconds),
+            min(duration, item.end_seconds),
+        )
+        for item in segments
+        if item.no_beat and item.end_seconds > 0 and item.start_seconds < duration
+    )
+    merged: list[tuple[float, float]] = []
+    for start, end in blocked:
+        if merged and start <= merged[-1][1] + 1e-9:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def active_ranges(
+    segments: list[ActivitySegment], duration: float
+) -> list[tuple[float, float]]:
+    """Return the complement of all NO_BEAT annotations."""
+    active: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in no_beat_ranges(segments, duration):
+        if start > cursor + 1e-9:
+            active.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < duration - 1e-9:
+        active.append((cursor, duration))
+    return active
+
+
+def filter_result_to_ranges(
+    result: BeatResult, ranges: list[tuple[float, float]]
+) -> BeatResult:
+    """Keep beats/downbeats that fall within at least one active range."""
+    beat_times = np.asarray(result.beat_times, dtype=float)
+    downbeat_times = np.asarray(
+        result.downbeat_times if result.downbeat_times is not None else [],
+        dtype=float,
+    )
+
+    def keep_mask(times: np.ndarray) -> np.ndarray:
+        mask = np.zeros(len(times), dtype=bool)
+        for index, (start, end) in enumerate(ranges):
+            is_last = index == len(ranges) - 1
+            mask |= (times >= start) & ((times <= end) if is_last else (times < end))
+        return mask
+
+    return BeatResult(
+        method=result.method,
+        beat_times=beat_times[keep_mask(beat_times)],
+        reported_bpm=result.reported_bpm,
+        downbeat_times=downbeat_times[keep_mask(downbeat_times)],
+        note=result.note,
+    )
+
+
+def write_inference_metadata_csv(path: Path, metadata: InferenceMetadata) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(asdict(metadata)))
+        writer.writeheader()
+        writer.writerow(asdict(metadata))
+
+
+def read_inference_metadata_csv(path: Path) -> InferenceMetadata:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        row = next(csv.DictReader(handle), None)
+    if row is None:
+        raise ValueError(f"Inference metadata is empty: {path}")
+    return InferenceMetadata(
+        fps=float(row["fps"]),
+        window_seconds=float(row["window_seconds"]),
+        hop_seconds=float(row["hop_seconds"]),
+        overlap_windows=int(row["overlap_windows"]),
+        sample_rate=int(row["sample_rate"]),
+        duration_seconds=float(row["duration_seconds"]),
+        audio_path=row["audio_path"],
+    )
 
 
 def write_frame_predictions_csv(path: Path, frames: FramePredictions) -> None:
@@ -597,7 +954,7 @@ def write_frame_predictions_csv(path: Path, frames: FramePredictions) -> None:
             writer.writerow(
                 [
                     index,
-                    f"{index / frames.fps:.6f}",
+                    f"{index / frames.fps:.9f}",
                     f"{frames.raw_beat_logits[index]:.7f}",
                     f"{raw_beat_prob[index]:.7f}",
                     f"{frames.raw_downbeat_logits[index]:.7f}",
@@ -610,6 +967,32 @@ def write_frame_predictions_csv(path: Path, frames: FramePredictions) -> None:
             )
 
 
+def read_frame_predictions_csv(
+    path: Path, metadata: InferenceMetadata
+) -> FramePredictions:
+    rows: list[dict[str, str]]
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return FramePredictions(
+        fps=metadata.fps,
+        raw_beat_logits=np.asarray(
+            [float(row["raw_beat_logit"]) for row in rows], dtype=float
+        ),
+        raw_downbeat_logits=np.asarray(
+            [float(row["raw_downbeat_logit"]) for row in rows], dtype=float
+        ),
+        fused_beat_logits=np.asarray(
+            [float(row["fused_beat_logit"]) for row in rows], dtype=float
+        ),
+        fused_downbeat_logits=np.asarray(
+            [float(row["fused_downbeat_logit"]) for row in rows], dtype=float
+        ),
+        window_seconds=metadata.window_seconds,
+        hop_seconds=metadata.hop_seconds,
+        overlap_windows=metadata.overlap_windows,
+    )
+
+
 def write_grid_decisions_csv(path: Path, decoding: GridDecoding) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
@@ -617,6 +1000,7 @@ def write_grid_decisions_csv(path: Path, decoding: GridDecoding) -> None:
             [
                 "interval_index",
                 "interval_midpoint_seconds",
+                "interval_duration_seconds",
                 "base_smoothed_bpm",
                 "selected_scale",
                 "normalized_bpm",
@@ -628,7 +1012,8 @@ def write_grid_decisions_csv(path: Path, decoding: GridDecoding) -> None:
             writer.writerow(
                 [
                     index,
-                    f"{decoding.interval_midpoints[index]:.6f}",
+                    f"{decoding.interval_midpoints[index]:.9f}",
+                    f"{decoding.interval_durations[index]:.9f}",
                     f"{decoding.base_bpm[index]:.4f}",
                     f"{decoding.selected_scale[index]:g}",
                     f"{decoding.normalized_bpm[index]:.4f}",
@@ -638,12 +1023,42 @@ def write_grid_decisions_csv(path: Path, decoding: GridDecoding) -> None:
             )
 
 
+def read_grid_decisions_csv(path: Path) -> GridDecoding:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return GridDecoding(
+        interval_midpoints=np.asarray(
+            [float(row["interval_midpoint_seconds"]) for row in rows], dtype=float
+        ),
+        interval_durations=np.asarray(
+            [float(row["interval_duration_seconds"]) for row in rows], dtype=float
+        ),
+        base_bpm=np.asarray(
+            [float(row["base_smoothed_bpm"]) for row in rows], dtype=float
+        ),
+        selected_scale=np.asarray(
+            [float(row["selected_scale"]) for row in rows], dtype=float
+        ),
+        normalized_bpm=np.asarray(
+            [float(row["normalized_bpm"]) for row in rows], dtype=float
+        ),
+        confidence=np.asarray(
+            [float(row["scale_confidence"]) for row in rows], dtype=float
+        ),
+        segment_id=np.asarray(
+            [int(row["segment_id"]) for row in rows], dtype=int
+        ),
+    )
+
+
 def write_beats_csv(
     path: Path,
     result: BeatResult,
     midpoints: np.ndarray,
     raw_bpm: np.ndarray,
     smooth_bpm: np.ndarray,
+    sample_rate: int,
+    ranges: list[tuple[float, float]] | None = None,
 ) -> None:
     downbeats = np.asarray(result.downbeat_times if result.downbeat_times is not None else [])
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
@@ -651,29 +1066,89 @@ def write_beats_csv(
         writer.writerow(
             [
                 "beat_index",
+                "sample_index",
                 "beat_time_seconds",
                 "is_downbeat",
+                "activity_segment_id",
+                "is_no_beat",
                 "interval_midpoint_seconds",
                 "raw_local_bpm",
                 "smoothed_local_bpm",
             ]
         )
+
+        def activity_id(time_seconds: float) -> int:
+            if ranges is None:
+                return 0
+            for range_index, (start, end) in enumerate(ranges):
+                is_last = range_index == len(ranges) - 1
+                if time_seconds >= start and (
+                    time_seconds <= end if is_last else time_seconds < end
+                ):
+                    return range_index
+            return -1
+
         for i, beat_time in enumerate(result.beat_times):
             is_downbeat = bool(
                 downbeats.size and np.min(np.abs(downbeats - beat_time)) <= 0.05
             )
-            if i == 0 or i - 1 >= len(raw_bpm):
-                row = [i + 1, f"{beat_time:.6f}", int(is_downbeat), "", "", ""]
+            current_activity = activity_id(float(beat_time))
+            previous_activity = (
+                activity_id(float(result.beat_times[i - 1])) if i else -1
+            )
+            has_active_interval = (
+                i > 0
+                and i - 1 < len(raw_bpm)
+                and current_activity >= 0
+                and current_activity == previous_activity
+            )
+            if not has_active_interval:
+                row = [
+                    i + 1,
+                    int(round(beat_time * sample_rate)),
+                    f"{beat_time:.9f}",
+                    int(is_downbeat),
+                    current_activity,
+                    int(current_activity < 0),
+                    "",
+                    "",
+                    "",
+                ]
             else:
                 row = [
                     i + 1,
-                    f"{beat_time:.6f}",
+                    int(round(beat_time * sample_rate)),
+                    f"{beat_time:.9f}",
                     int(is_downbeat),
-                    f"{midpoints[i - 1]:.6f}",
+                    current_activity,
+                    int(current_activity < 0),
+                    f"{midpoints[i - 1]:.9f}",
                     f"{raw_bpm[i - 1]:.4f}",
                     f"{smooth_bpm[i - 1]:.4f}",
                 ]
             writer.writerow(row)
+
+
+def read_beats_csv(path: Path, method: str, note: str = "") -> BeatResult:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    beat_times = np.asarray(
+        [float(row["beat_time_seconds"]) for row in rows], dtype=float
+    )
+    downbeat_times = np.asarray(
+        [
+            float(row["beat_time_seconds"])
+            for row in rows
+            if _parse_bool(row.get("is_downbeat", "0"))
+        ],
+        dtype=float,
+    )
+    return BeatResult(
+        method=method,
+        beat_times=beat_times,
+        downbeat_times=downbeat_times,
+        note=note,
+    )
 
 
 def write_click_track(path: Path, y: np.ndarray, sr: int, result: BeatResult) -> None:
@@ -703,6 +1178,7 @@ def write_plot(
     title: str,
     analyses: list[dict],
     duration: float,
+    blocked_ranges: list[tuple[float, float]],
 ) -> None:
     fig, axes = plt.subplots(
         len(analyses),
@@ -712,6 +1188,14 @@ def write_plot(
     )
     axes = np.atleast_1d(axes)
     for ax, analysis in zip(axes, analyses):
+        for blocked_index, (start, end) in enumerate(blocked_ranges):
+            ax.axvspan(
+                start,
+                end,
+                color="0.5",
+                alpha=0.16,
+                label="NO_BEAT" if blocked_index == 0 else None,
+            )
         mids = analysis["midpoints"]
         raw = analysis["raw_bpm"]
         smooth = analysis["smooth_bpm"]
@@ -750,6 +1234,7 @@ def write_probability_plot(
     title: str,
     frames: FramePredictions,
     duration: float,
+    blocked_ranges: list[tuple[float, float]],
 ) -> None:
     times = np.arange(len(frames.raw_beat_logits), dtype=float) / frames.fps
     series = [
@@ -766,6 +1251,14 @@ def write_probability_plot(
     ]
     fig, axes = plt.subplots(2, 1, figsize=(13, 6.4), sharex=True)
     for ax, (label, raw, fused) in zip(axes, series):
+        for blocked_index, (start, end) in enumerate(blocked_ranges):
+            ax.axvspan(
+                start,
+                end,
+                color="0.5",
+                alpha=0.16,
+                label="NO_BEAT" if blocked_index == 0 else None,
+            )
         ax.plot(times, raw, linewidth=0.65, alpha=0.65, label="official raw")
         ax.plot(times, fused, linewidth=0.8, alpha=0.8, label="overlap fused")
         ax.axhline(0.5, color="black", linestyle="--", linewidth=0.8, alpha=0.6)
@@ -785,22 +1278,64 @@ def write_grid_plot(
     path: Path,
     title: str,
     decoding: GridDecoding,
+    normalized_result: BeatResult,
+    ranges: list[tuple[float, float]],
+    blocked_ranges: list[tuple[float, float]],
     duration: float,
 ) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13, 6.4), sharex=True)
-    axes[0].plot(
-        decoding.interval_midpoints,
-        decoding.base_bpm,
-        linewidth=1.0,
-        alpha=0.65,
-        label="fused base BPM",
-    )
-    axes[0].plot(
-        decoding.interval_midpoints,
-        decoding.normalized_bpm,
-        linewidth=1.3,
-        label="normalized BPM",
-    )
+    for range_index, (start, end) in enumerate(ranges):
+        mask = (decoding.interval_midpoints >= start) & (
+            decoding.interval_midpoints < end
+        )
+        if np.any(mask):
+            axes[0].plot(
+                decoding.interval_midpoints[mask],
+                decoding.base_bpm[mask],
+                color="tab:blue",
+                linewidth=1.0,
+                alpha=0.65,
+                label="fused base BPM" if range_index == 0 else None,
+            )
+            axes[0].plot(
+                decoding.interval_midpoints[mask],
+                decoding.normalized_bpm[mask],
+                color="tab:orange",
+                linewidth=1.3,
+                label="grid decision BPM" if range_index == 0 else None,
+            )
+            axes[1].step(
+                decoding.interval_midpoints[mask],
+                decoding.selected_scale[mask],
+                color="tab:blue",
+                where="mid",
+                linewidth=1.2,
+            )
+        beat_mask = (normalized_result.beat_times >= start) & (
+            normalized_result.beat_times < end
+        )
+        midpoints, _, actual_bpm = local_tempo(
+            normalized_result.beat_times[beat_mask]
+        )
+        if len(midpoints):
+            axes[0].plot(
+                midpoints,
+                actual_bpm,
+                color="tab:green",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.85,
+                label="final actual BPM" if range_index == 0 else None,
+            )
+    for ax in axes:
+        for blocked_index, (start, end) in enumerate(blocked_ranges):
+            ax.axvspan(
+                start,
+                end,
+                color="0.5",
+                alpha=0.16,
+                label="NO_BEAT" if blocked_index == 0 else None,
+            )
     axes[0].axhspan(
         NORMALIZED_BPM_MIN,
         NORMALIZED_BPM_MAX,
@@ -811,12 +1346,6 @@ def write_grid_plot(
     axes[0].set_ylabel("BPM")
     axes[0].grid(alpha=0.2)
     axes[0].legend(loc="upper right", fontsize=8)
-    axes[1].step(
-        decoding.interval_midpoints,
-        decoding.selected_scale,
-        where="mid",
-        linewidth=1.2,
-    )
     axes[1].set_yscale("log", base=2)
     axes[1].set_yticks(GRID_SCALES, [f"{scale:g}x" for scale in GRID_SCALES])
     axes[1].set_ylabel("Selected grid")
@@ -833,97 +1362,200 @@ def analyse_file(
     audio_path: Path,
     output_root: Path,
     args: argparse.Namespace,
-    estimator: BeatThisEstimator,
+    estimator: BeatThisEstimator | None,
 ) -> list[dict]:
     y, sr = librosa.load(audio_path, sr=args.sample_rate, mono=True)
     duration = librosa.get_duration(y=y, sr=sr)
     stem = safe_stem(audio_path)
     file_output = output_root / stem
     file_output.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "metadata": file_output / f"{stem}__inference.csv",
+        "segments": file_output / f"{stem}__segments.csv",
+        "frames": file_output / f"{stem}__beat-this__frames.csv",
+        "raw": file_output / f"{stem}__beat-this-raw__beats.csv",
+        "fused": file_output / f"{stem}__beat-this-fused__beats.csv",
+        "normalized": file_output / f"{stem}__beat-this-normalized__beats.csv",
+        "grid": file_output / f"{stem}__beat-this__grid.csv",
+    }
+    ensure_segments_csv(paths["segments"], duration)
+    activity_segments = read_segments_csv(paths["segments"], duration)
+    ranges = active_ranges(activity_segments, duration)
+    blocked_ranges = no_beat_ranges(activity_segments, duration)
 
-    results, frames = estimator(y, sr)
-    fused_result = next(
-        result for result in results if result.method == "beat-this-fused"
+    raw_note = "Official 30-second keep-first chunk aggregation"
+    if estimator is not None:
+        inferred_results, inferred_frames = estimator(y, sr)
+        metadata = InferenceMetadata(
+            fps=inferred_frames.fps,
+            window_seconds=inferred_frames.window_seconds,
+            hop_seconds=inferred_frames.hop_seconds,
+            overlap_windows=inferred_frames.overlap_windows,
+            sample_rate=sr,
+            duration_seconds=duration,
+            audio_path=str(audio_path.resolve()),
+        )
+        write_inference_metadata_csv(paths["metadata"], metadata)
+        write_frame_predictions_csv(paths["frames"], inferred_frames)
+        for result in inferred_results:
+            result.beat_times = np.unique(
+                result.beat_times[np.isfinite(result.beat_times)]
+            )
+            midpoints, raw_bpm, smooth_bpm = local_tempo(result.beat_times)
+            write_beats_csv(
+                paths["raw"] if result.method == "beat-this-raw" else paths["fused"],
+                result,
+                midpoints,
+                raw_bpm,
+                smooth_bpm,
+                sr,
+                ranges,
+            )
+    else:
+        missing_cache = [
+            path
+            for path in (paths["metadata"], paths["frames"], paths["raw"], paths["fused"])
+            if not path.is_file()
+        ]
+        if missing_cache:
+            raise FileNotFoundError(
+                "--reuse-inference requires cached files:\n  "
+                + "\n  ".join(str(path) for path in missing_cache)
+            )
+
+    # From this point onward CSV files are the only source of inference data.
+    metadata = read_inference_metadata_csv(paths["metadata"])
+    if metadata.sample_rate != sr:
+        raise ValueError(
+            f"Cached sample rate {metadata.sample_rate} does not match loaded rate {sr}"
+        )
+    if abs(metadata.duration_seconds - duration) > 0.05:
+        raise ValueError(
+            "Cached inference duration does not match the current audio file: "
+            f"{metadata.duration_seconds:.3f} vs {duration:.3f} seconds"
+        )
+    if Path(metadata.audio_path).resolve() != audio_path.resolve():
+        raise ValueError(
+            "Cached inference belongs to a different audio path: "
+            f"{metadata.audio_path}"
+        )
+    frames = read_frame_predictions_csv(paths["frames"], metadata)
+    fused_note = (
+        "30-second shifted windows with Hann-weighted logit fusion "
+        f"and {metadata.hop_seconds:g}-second hop"
     )
-    normalized_result, grid_decoding = build_normalized_grid(fused_result, frames)
-    results.append(normalized_result)
-    analyses: list[dict] = []
-    for result in results:
-        result.beat_times = np.unique(
-            result.beat_times[np.isfinite(result.beat_times)]
-        )
+    raw_result = read_beats_csv(paths["raw"], "beat-this-raw", raw_note)
+    fused_result = read_beats_csv(paths["fused"], "beat-this-fused", fused_note)
+    for result, path in (
+        (raw_result, paths["raw"]),
+        (fused_result, paths["fused"]),
+    ):
         midpoints, raw_bpm, smooth_bpm = local_tempo(result.beat_times)
-        main_bpm = modal_tempo(midpoints, smooth_bpm, args.min_bpm, args.max_bpm)
-        regions = detect_change_regions(
-            midpoints,
-            smooth_bpm,
-            main_bpm,
-            relative_threshold=args.change_ratio,
-            absolute_threshold=args.change_bpm,
-            min_intervals=args.min_change_beats,
-            min_duration=args.min_change_seconds,
-        )
-        analysis = {
-            "result": result,
-            "midpoints": midpoints,
-            "raw_bpm": raw_bpm,
-            "smooth_bpm": smooth_bpm,
-            "main_bpm": main_bpm,
-            "regions": regions,
-            "duration": duration,
-            "audio": audio_path,
-        }
-        analyses.append(analysis)
         write_beats_csv(
-            file_output / f"{stem}__{result.method}__beats.csv",
+            path,
             result,
             midpoints,
             raw_bpm,
             smooth_bpm,
+            sr,
+            ranges,
         )
+    raw_result = read_beats_csv(paths["raw"], "beat-this-raw", raw_note)
+    fused_result = read_beats_csv(paths["fused"], "beat-this-fused", fused_note)
+    normalized_result, grid_decoding = build_normalized_grid(
+        fused_result,
+        frames,
+        ranges,
+    )
+    normalized_midpoints, normalized_raw, normalized_smooth = local_tempo(
+        normalized_result.beat_times
+    )
+    write_beats_csv(
+        paths["normalized"],
+        normalized_result,
+        normalized_midpoints,
+        normalized_raw,
+        normalized_smooth,
+        sr,
+        ranges,
+    )
+    write_grid_decisions_csv(paths["grid"], grid_decoding)
+
+    # Reload derived CSVs too, so plots/reports cannot diverge from saved data.
+    normalized_result = read_beats_csv(
+        paths["normalized"],
+        "beat-this-normalized",
+        normalized_result.note,
+    )
+    grid_decoding = read_grid_decisions_csv(paths["grid"])
+    stored_results = [raw_result, fused_result, normalized_result]
+    analyses = [
+        analyse_result_from_ranges(result, ranges, duration, args, audio_path)
+        for result in stored_results
+    ]
+    for analysis in analyses:
+        result = analysis["result"]
         write_click_track(
             file_output / f"{stem}__{result.method}__clicks.wav", y, sr, result
         )
 
-    write_frame_predictions_csv(
-        file_output / f"{stem}__beat-this__frames.csv", frames
+    write_plot(
+        file_output / f"{stem}__tempo.png",
+        audio_path.name,
+        analyses,
+        duration,
+        blocked_ranges,
     )
-    write_grid_decisions_csv(
-        file_output / f"{stem}__beat-this__grid.csv", grid_decoding
-    )
-    write_plot(file_output / f"{stem}__tempo.png", audio_path.name, analyses, duration)
     write_probability_plot(
         file_output / f"{stem}__probabilities.png",
         audio_path.name,
         frames,
         duration,
+        blocked_ranges,
     )
     write_grid_plot(
         file_output / f"{stem}__grid.png",
         audio_path.name,
         grid_decoding,
+        normalized_result,
+        ranges,
+        blocked_ranges,
         duration,
     )
-    fused_intervals = np.diff(fused_result.beat_times)
-    normalized_intervals = np.diff(normalized_result.beat_times)
-    normalized_grid_bpm = np.divide(
-        60.0,
-        normalized_intervals,
-        out=np.full_like(normalized_intervals, np.inf),
-        where=normalized_intervals > 0,
+
+    normalized_grid_bpm_parts: list[np.ndarray] = []
+    for range_index, (start, end) in enumerate(ranges):
+        is_last = range_index == len(ranges) - 1
+        mask = (normalized_result.beat_times >= start) & (
+            (normalized_result.beat_times <= end)
+            if is_last
+            else (normalized_result.beat_times < end)
+        )
+        intervals = np.diff(normalized_result.beat_times[mask])
+        if len(intervals):
+            normalized_grid_bpm_parts.append(60.0 / intervals)
+    normalized_grid_bpm = (
+        np.concatenate(normalized_grid_bpm_parts)
+        if normalized_grid_bpm_parts
+        else np.asarray([], dtype=float)
     )
     scale_usage = []
     for scale in GRID_SCALES:
         mask = grid_decoding.selected_scale == scale
-        seconds = float(np.sum(fused_intervals[mask])) if len(mask) else 0.0
+        seconds = (
+            float(np.sum(grid_decoding.interval_durations[mask]))
+            if len(mask)
+            else 0.0
+        )
+        active_grid_seconds = float(np.sum(grid_decoding.interval_durations))
         scale_usage.append(
             {
                 "scale": float(scale),
                 "intervals": int(np.sum(mask)),
                 "seconds": round(seconds, 3),
                 "time_percent": (
-                    round(100.0 * seconds / np.sum(fused_intervals), 2)
-                    if np.sum(fused_intervals) > 0
+                    round(100.0 * seconds / active_grid_seconds, 2)
+                    if active_grid_seconds > 0
                     else 0.0
                 ),
             }
@@ -931,6 +1563,17 @@ def analyse_file(
     report = {
         "audio": str(audio_path.resolve()),
         "duration_seconds": round(duration, 3),
+        "activity": {
+            "segments_csv": paths["segments"].name,
+            "active_seconds": round(sum(end - start for start, end in ranges), 3),
+            "no_beat_seconds": round(
+                sum(end - start for start, end in blocked_ranges), 3
+            ),
+            "no_beat_ranges": [
+                {"start_seconds": start, "end_seconds": end}
+                for start, end in blocked_ranges
+            ],
+        },
         "frame_inference": {
             "fps": frames.fps,
             "window_seconds": frames.window_seconds,
@@ -956,8 +1599,9 @@ def analyse_file(
             ),
         },
         "interpretation_note": (
-            "Compare raw and fused click-track WAVs. Highlighted regions are candidates, "
-            "not ground truth. "
+            "All plots and reports are regenerated from saved CSV data. "
+            "NO_BEAT ranges are excluded from clicks, tempo statistics, and grid decoding. "
+            "Highlighted tempo-change regions are candidates, not ground truth. "
             "Exact 2x/0.5x tempo changes are musically ambiguous; raw BPM remains in each beat CSV."
         ),
         "methods": [
@@ -1005,6 +1649,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Hop between overlapping 30-second inference windows (default: 10)",
     )
+    parser.add_argument(
+        "--reuse-inference",
+        action="store_true",
+        help=(
+            "Skip Beat This! and rebuild normalized CSVs, clicks, plots, and "
+            "reports from cached inference CSVs plus the editable segments CSV"
+        ),
+    )
     return parser
 
 
@@ -1021,15 +1673,17 @@ def main() -> int:
         print("Require 0 < --beat-this-hop-seconds < 30", file=sys.stderr)
         return 2
     args.output.mkdir(parents=True, exist_ok=True)
-    try:
-        beat_this = BeatThisEstimator(
-            args.beat_this_device,
-            args.beat_this_checkpoint,
-            hop_seconds=args.beat_this_hop_seconds,
-        )
-    except Exception as exc:
-        print(f"Unable to initialize Beat This!: {exc}", file=sys.stderr)
-        return 1
+    beat_this: BeatThisEstimator | None = None
+    if not args.reuse_inference:
+        try:
+            beat_this = BeatThisEstimator(
+                args.beat_this_device,
+                args.beat_this_checkpoint,
+                hop_seconds=args.beat_this_hop_seconds,
+            )
+        except Exception as exc:
+            print(f"Unable to initialize Beat This!: {exc}", file=sys.stderr)
+            return 1
 
     all_analyses: list[dict] = []
     for audio_path in args.audio:
@@ -1037,7 +1691,7 @@ def main() -> int:
         try:
             all_analyses.extend(analyse_file(audio_path, args.output, args, beat_this))
         except Exception as exc:
-            print(f"Beat This! failed for {audio_path.name}: {exc}", file=sys.stderr)
+            print(f"Processing failed for {audio_path.name}: {exc}", file=sys.stderr)
             return 1
 
     summary_path = args.output / "summary.csv"
@@ -1048,6 +1702,8 @@ def main() -> int:
                 "audio",
                 "method",
                 "duration_seconds",
+                "active_seconds",
+                "no_beat_seconds",
                 "reported_bpm",
                 "dominant_bpm_from_beats",
                 "detected_beats",
@@ -1061,6 +1717,8 @@ def main() -> int:
                     str(item["audio"]),
                     result.method,
                     f"{item['duration']:.3f}",
+                    f"{item['active_duration']:.3f}",
+                    f"{item['no_beat_duration']:.3f}",
                     "" if result.reported_bpm is None else f"{result.reported_bpm:.3f}",
                     "" if not np.isfinite(item["main_bpm"]) else f"{item['main_bpm']:.3f}",
                     len(result.beat_times),
