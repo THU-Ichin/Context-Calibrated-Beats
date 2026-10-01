@@ -286,6 +286,57 @@ class CsvPipelineTest(unittest.TestCase):
         )
         self.assertEqual({item.activity_segment_id for item in events}, {0, 1})
 
+    def test_p3c_bidirectional_refinement_uses_both_fixed_anchors(self) -> None:
+        times = np.asarray([0.00, 0.36, 0.76, 1.16, 1.52])
+        logits = np.full(600, -6.0)
+        for time_seconds in (0.36, 0.74, 1.16):
+            logits[round(time_seconds * self.fps)] = 6.0
+        frames = bpm.FramePredictions(
+            fps=self.fps,
+            raw_beat_logits=logits.copy(),
+            raw_downbeat_logits=logits.copy(),
+            fused_beat_logits=logits.copy(),
+            fused_downbeat_logits=logits.copy(),
+            window_seconds=30.0,
+            hop_seconds=10.0,
+            overlap_windows=1,
+        )
+        events = []
+        for index, time_seconds in enumerate(times):
+            bridge = index == 2
+            events.append(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=index + 1,
+                    activity_segment_id=0,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=1.0,
+                    target_period_seconds=0.40,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=0.01,
+                    downbeat_probability=0.0,
+                    event_source="phase_bridge" if bridge else "acoustic_peak",
+                    transition_type="phase_bridge" if bridge else "stable",
+                    path_cost=float(index),
+                )
+            )
+        result, refined, transitions = bpm.refine_phase_grid_bidirectionally(
+            bpm.BeatResult("beat-this-phase-aware", times),
+            events,
+            [],
+            frames,
+        )
+
+        self.assertEqual(result.beat_times[1], times[1])
+        self.assertEqual(result.beat_times[3], times[3])
+        self.assertTrue(np.any(np.abs(result.beat_times - times) > 1e-6))
+        self.assertTrue(
+            any(item.transition_type == "bidirectional_bridge" for item in transitions)
+        )
+        intervals = np.diff(result.beat_times)
+        self.assertTrue(np.all(intervals > 60.0 / bpm.NORMALIZED_BPM_MAX))
+        self.assertTrue(np.all(intervals <= 60.0 / bpm.NORMALIZED_BPM_MIN))
+
 
 if __name__ == "__main__":
     unittest.main()

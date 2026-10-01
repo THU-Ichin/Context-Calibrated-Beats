@@ -12,7 +12,8 @@ P3-A writes interval diagnostics and broad repair candidates. P3-B adjudicates
 those candidates into a traceable repaired-beat proposal. Preview mode keeps
 the proposal out of grid normalisation; conservative mode uses its saved CSV.
 P3-C adds a phase-continuous five-scale grid beside the legacy decoder and can
-promote that saved preview to the official normalized output.
+promote that saved preview to the official normalized output. Its optional
+bidirectional pass jointly refines bridge beats between stable anchors.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -1682,6 +1683,303 @@ def build_phase_aware_grid(
     return result, events, transitions
 
 
+def refine_phase_grid_bidirectionally(
+    phase_result: BeatResult,
+    events: list[PhaseGridEvent],
+    transitions: list[GridTransition],
+    frames: FramePredictions,
+) -> tuple[BeatResult, list[PhaseGridEvent], list[GridTransition]]:
+    """Jointly refine bridge beats between stable past and future anchors."""
+    refined = [PhaseGridEvent(**asdict(item)) for item in events]
+    refined_transitions = [GridTransition(**asdict(item)) for item in transitions]
+    minimum_period = 60.0 / NORMALIZED_BPM_MAX + 1e-4
+    maximum_period = 60.0 / NORMALIZED_BPM_MIN
+    beat_probability = expit(frames.fused_beat_logits)
+    downbeat_probability = expit(frames.fused_downbeat_logits)
+    original_downbeats = np.asarray(
+        phase_result.downbeat_times
+        if phase_result.downbeat_times is not None
+        else [],
+        dtype=float,
+    )
+
+    def probabilities(time_seconds: float) -> tuple[float, float]:
+        index = _frame_index(time_seconds, frames)
+        return float(beat_probability[index]), float(downbeat_probability[index])
+
+    def event_cost(
+        local_index: int,
+        candidate_time: float,
+        original_time: float,
+        local_events: list[PhaseGridEvent],
+    ) -> float:
+        beat_prob, downbeat_prob = probabilities(candidate_time)
+        evidence = min(1.0, beat_prob + 0.25 * downbeat_prob)
+        shift = (candidate_time - original_time) / 0.08
+        return 0.90 * (1.0 - evidence) + 0.12 * shift**2
+
+    def path_cost(
+        path_times: list[float], local_events: list[PhaseGridEvent]
+    ) -> float:
+        total = 0.0
+        previous_interval: float | None = None
+        for index, time_seconds in enumerate(path_times):
+            if 0 < index < len(path_times) - 1:
+                total += event_cost(
+                    index,
+                    time_seconds,
+                    local_events[index].beat_time_seconds,
+                    local_events,
+                )
+            if index == 0:
+                continue
+            interval = time_seconds - path_times[index - 1]
+            target = 0.5 * (
+                local_events[index - 1].target_period_seconds
+                + local_events[index].target_period_seconds
+            )
+            total += 1.35 * math.log(
+                max(interval, 1e-9) / max(target, 1e-9)
+            ) ** 2
+            if previous_interval is not None:
+                total += 3.50 * math.log(
+                    max(interval, 1e-9) / max(previous_interval, 1e-9)
+                ) ** 2
+            previous_interval = interval
+        return total
+
+    windows: list[tuple[int, int]] = []
+    for segment_id in sorted({item.activity_segment_id for item in refined}):
+        segment_indices = [
+            index
+            for index, item in enumerate(refined)
+            if item.activity_segment_id == segment_id
+        ]
+        unstable_positions = [
+            position
+            for position, global_index in enumerate(segment_indices)
+            if refined[global_index].event_source == "phase_bridge"
+            or refined[global_index].transition_type == "scale_switch"
+        ]
+        if not unstable_positions:
+            continue
+        runs = np.split(
+            np.asarray(unstable_positions, dtype=int),
+            np.flatnonzero(np.diff(unstable_positions) > 1) + 1,
+        )
+        for run in runs:
+            if not len(run):
+                continue
+            local_start = max(0, int(run[0]) - 1)
+            local_end = min(len(segment_indices) - 1, int(run[-1]) + 1)
+            if local_end - local_start >= 2:
+                windows.append(
+                    (segment_indices[local_start], segment_indices[local_end])
+                )
+
+    # Merge overlapping transition windows so each beat is optimized once.
+    merged_windows: list[tuple[int, int]] = []
+    for start, end in sorted(windows):
+        if merged_windows and start <= merged_windows[-1][1]:
+            merged_windows[-1] = (
+                merged_windows[-1][0],
+                max(merged_windows[-1][1], end),
+            )
+        else:
+            merged_windows.append((start, end))
+
+    for start, end in merged_windows:
+        local_events = refined[start : end + 1]
+        if len(local_events) < 3:
+            continue
+        candidate_times: list[list[float]] = []
+        for index, item in enumerate(local_events):
+            if index in {0, len(local_events) - 1}:
+                candidate_times.append([item.beat_time_seconds])
+                continue
+            offsets = np.arange(-0.08, 0.0801, 1.0 / frames.fps)
+            values = np.r_[
+                item.beat_time_seconds,
+                item.beat_time_seconds + offsets,
+            ]
+            values = np.unique(np.round(values, 9))
+            candidate_times.append([float(value) for value in values])
+
+        # Beam search retains second-order interval continuity while optimizing
+        # every bridge beat jointly between two fixed anchors.
+        beam: list[tuple[float, list[float], float]] = []
+        first = candidate_times[0][0]
+        for second in candidate_times[1]:
+            interval = second - first
+            if not minimum_period <= interval <= maximum_period:
+                continue
+            target = 0.5 * (
+                local_events[0].target_period_seconds
+                + local_events[1].target_period_seconds
+            )
+            cost = 1.35 * math.log(interval / max(target, 1e-9)) ** 2
+            if len(local_events) > 2:
+                cost += event_cost(
+                    1,
+                    second,
+                    local_events[1].beat_time_seconds,
+                    local_events,
+                )
+            beam.append((cost, [first, second], interval))
+        for position in range(2, len(local_events)):
+            expanded: list[tuple[float, list[float], float]] = []
+            for cost, path, previous_interval in beam:
+                for candidate_time in candidate_times[position]:
+                    interval = candidate_time - path[-1]
+                    if not minimum_period <= interval <= maximum_period:
+                        continue
+                    ratio = interval / previous_interval
+                    if not 0.85 <= ratio <= 1.15:
+                        continue
+                    target = 0.5 * (
+                        local_events[position - 1].target_period_seconds
+                        + local_events[position].target_period_seconds
+                    )
+                    added = 1.35 * math.log(
+                        interval / max(target, 1e-9)
+                    ) ** 2
+                    added += 3.50 * math.log(interval / previous_interval) ** 2
+                    if position < len(local_events) - 1:
+                        added += event_cost(
+                            position,
+                            candidate_time,
+                            local_events[position].beat_time_seconds,
+                            local_events,
+                        )
+                    expanded.append(
+                        (cost + added, path + [candidate_time], interval)
+                    )
+            beam = sorted(expanded, key=lambda item: item[0])[:500]
+            if not beam:
+                break
+        if not beam:
+            continue
+        def outside_boundary_cost(path: list[float]) -> float:
+            cost = 0.0
+            if (
+                start > 0
+                and refined[start - 1].activity_segment_id
+                == refined[start].activity_segment_id
+            ):
+                outside = path[0] - refined[start - 1].beat_time_seconds
+                inside = path[1] - path[0]
+                ratio = inside / outside
+                if not 0.85 <= ratio <= 1.15:
+                    return math.inf
+                cost += 3.50 * math.log(ratio) ** 2
+            if (
+                end + 1 < len(refined)
+                and refined[end + 1].activity_segment_id
+                == refined[end].activity_segment_id
+            ):
+                inside = path[-1] - path[-2]
+                outside = refined[end + 1].beat_time_seconds - path[-1]
+                ratio = outside / inside
+                if not 0.85 <= ratio <= 1.15:
+                    return math.inf
+                cost += 3.50 * math.log(ratio) ** 2
+            return cost
+
+        scored_beam = [
+            (cost + outside_boundary_cost(path), path, interval)
+            for cost, path, interval in beam
+        ]
+        scored_beam = [item for item in scored_beam if np.isfinite(item[0])]
+        if not scored_beam:
+            continue
+        best_cost, best_path, _ = min(scored_beam, key=lambda item: item[0])
+        original_path = [item.beat_time_seconds for item in local_events]
+        original_cost = path_cost(original_path, local_events) + outside_boundary_cost(
+            original_path
+        )
+        if original_cost - best_cost < 0.03 * max(original_cost, 1.0):
+            continue
+        shifts = np.abs(np.asarray(best_path) - np.asarray(original_path))
+        if float(np.max(shifts)) > 0.080001:
+            continue
+        changed = False
+        for offset, (item, new_time) in enumerate(zip(local_events, best_path)):
+            if offset in {0, len(local_events) - 1}:
+                continue
+            if abs(item.beat_time_seconds - new_time) < 1e-6:
+                continue
+            changed = True
+            global_item = refined[start + offset]
+            global_item.beat_time_seconds = float(new_time)
+            global_item.phase_residual_seconds = (
+                float(new_time) - global_item.predicted_time_seconds
+            )
+            beat_prob, downbeat_prob = probabilities(float(new_time))
+            global_item.beat_probability = beat_prob
+            global_item.downbeat_probability = downbeat_prob
+            global_item.event_source = "bidirectional_refined"
+            global_item.transition_type = "bidirectional_bridge"
+        if changed:
+            refined_transitions.append(
+                GridTransition(
+                    transition_id=len(refined_transitions) + 1,
+                    activity_segment_id=local_events[0].activity_segment_id,
+                    start_seconds=best_path[0],
+                    end_seconds=best_path[-1],
+                    previous_scale=local_events[0].selected_scale,
+                    next_scale=local_events[-1].selected_scale,
+                    previous_period_seconds=best_path[1] - best_path[0],
+                    next_period_seconds=best_path[-1] - best_path[-2],
+                    phase_adjustment_seconds=float(np.max(shifts)),
+                    transition_type="bidirectional_bridge",
+                    diagnostic_note=(
+                        f"Joint anchor refinement reduced local path cost from "
+                        f"{original_cost:.4f} to {best_cost:.4f}"
+                    ),
+                )
+            )
+
+    output_times = np.asarray([item.beat_time_seconds for item in refined], dtype=float)
+    if len(output_times) > 1 and np.any(np.diff(output_times) <= 0):
+        raise ValueError("Bidirectional phase refinement broke time ordering")
+    output_downbeats = np.asarray(
+        [
+            item.beat_time_seconds
+            for item in refined
+            if item.downbeat_probability >= 0.5
+            or (
+                len(original_downbeats)
+                and np.min(
+                    np.abs(original_downbeats - item.beat_time_seconds)
+                )
+                <= 0.07
+            )
+        ],
+        dtype=float,
+    )
+    cumulative_cost = 0.0
+    for index, item in enumerate(refined):
+        if index:
+            interval = item.beat_time_seconds - refined[index - 1].beat_time_seconds
+            if item.activity_segment_id == refined[index - 1].activity_segment_id:
+                if not minimum_period - 1e-6 <= interval <= maximum_period + 1e-6:
+                    raise ValueError("Bidirectional refinement produced invalid BPM")
+                cumulative_cost += abs(
+                    interval - item.target_period_seconds
+                ) / max(item.target_period_seconds, 1e-9)
+        cumulative_cost += 0.35 * (1.0 - item.beat_probability)
+        item.path_cost = cumulative_cost
+    result = BeatResult(
+        method="beat-this-phase-aware",
+        beat_times=output_times,
+        downbeat_times=output_downbeats,
+        note=(
+            "P3-C bidirectionally refined phase grid between stable anchors"
+        ),
+    )
+    return result, refined, refined_transitions
+
+
 def modal_tempo(
     midpoints: np.ndarray,
     bpm: np.ndarray,
@@ -2876,6 +3174,9 @@ def write_phase_grid_comparison_plot(
     transitions: list[GridTransition],
     duration: float,
     blocked_ranges: list[tuple[float, float]],
+    left_label: str = "legacy normalized",
+    right_label: str = "phase-aware",
+    comparison_name: str = "legacy vs P3-C phase-aware grid",
 ) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(14, 7.0), sharex=True)
     axes[0].scatter(
@@ -2884,7 +3185,7 @@ def write_phase_grid_comparison_plot(
         marker="|",
         s=55,
         color="tab:blue",
-        label="legacy normalized",
+        label=left_label,
     )
     axes[0].scatter(
         phase_result.beat_times,
@@ -2892,13 +3193,13 @@ def write_phase_grid_comparison_plot(
         marker="|",
         s=55,
         color="tab:orange",
-        label="phase-aware",
+        label=right_label,
     )
-    axes[0].set_yticks([0, 1], ["phase-aware", "legacy"])
+    axes[0].set_yticks([0, 1], [right_label, left_label])
     axes[0].set_ylim(-0.6, 1.6)
     for result, colour, label in (
-        (legacy_result, "tab:blue", "legacy actual BPM"),
-        (phase_result, "tab:orange", "phase-aware actual BPM"),
+        (legacy_result, "tab:blue", f"{left_label} actual BPM"),
+        (phase_result, "tab:orange", f"{right_label} actual BPM"),
     ):
         midpoint, raw_bpm, _ = local_tempo(result.beat_times)
         axes[1].plot(
@@ -2943,7 +3244,7 @@ def write_phase_grid_comparison_plot(
     axes[1].set_ylim(100, 250)
     axes[1].set_ylabel("BPM")
     axes[1].set_xlabel("Time (seconds)")
-    fig.suptitle(f"{title} — legacy vs P3-C phase-aware grid")
+    fig.suptitle(f"{title} — {comparison_name}")
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -3061,6 +3362,9 @@ def analyse_file(
         ),
         "phase_normalized": (
             file_output / f"{stem}__beat-this-phase-aware__beats.csv"
+        ),
+        "phase_greedy": (
+            file_output / f"{stem}__beat-this-phase-greedy__beats.csv"
         ),
         "phase_events": (
             file_output / f"{stem}__beat-this__phase-grid.csv"
@@ -3209,11 +3513,53 @@ def analyse_file(
     )
     write_grid_decisions_csv(paths["grid"], grid_decoding)
 
-    phase_result, phase_events, grid_transitions = build_phase_aware_grid(
-        grid_input,
-        frames,
+    greedy_phase_result, greedy_phase_events, greedy_grid_transitions = (
+        build_phase_aware_grid(
+            grid_input,
+            frames,
+            ranges,
+        )
+    )
+    greedy_phase_result.method = "beat-this-phase-greedy"
+    greedy_midpoints, greedy_raw, greedy_smooth = local_tempo(
+        greedy_phase_result.beat_times
+    )
+    write_beats_csv(
+        paths["phase_greedy"],
+        greedy_phase_result,
+        greedy_midpoints,
+        greedy_raw,
+        greedy_smooth,
+        sr,
         ranges,
     )
+    greedy_phase_result = read_beats_csv(
+        paths["phase_greedy"],
+        "beat-this-phase-greedy",
+        greedy_phase_result.note,
+    )
+    if args.phase_refinement == "bidirectional":
+        phase_result, phase_events, grid_transitions = (
+            refine_phase_grid_bidirectionally(
+                greedy_phase_result,
+                greedy_phase_events,
+                greedy_grid_transitions,
+                frames,
+            )
+        )
+    else:
+        phase_result = BeatResult(
+            method="beat-this-phase-aware",
+            beat_times=greedy_phase_result.beat_times.copy(),
+            downbeat_times=(
+                greedy_phase_result.downbeat_times.copy()
+                if greedy_phase_result.downbeat_times is not None
+                else np.asarray([], dtype=float)
+            ),
+            note="P3-C greedy forward phase grid without bidirectional refinement",
+        )
+        phase_events = greedy_phase_events
+        grid_transitions = greedy_grid_transitions
     phase_midpoints, phase_raw, phase_smooth = local_tempo(
         phase_result.beat_times
     )
@@ -3295,6 +3641,13 @@ def analyse_file(
         sr,
         preview_result,
     )
+    if args.phase_refinement == "bidirectional":
+        write_click_track(
+            file_output / f"{stem}__{greedy_phase_result.method}__clicks.wav",
+            y,
+            sr,
+            greedy_phase_result,
+        )
 
     write_plot(
         file_output / f"{stem}__tempo.png",
@@ -3338,6 +3691,18 @@ def analyse_file(
         duration,
         blocked_ranges,
     )
+    write_phase_grid_comparison_plot(
+        file_output / f"{stem}__beat-this__phase-refinement-comparison.png",
+        audio_path.name,
+        greedy_phase_result,
+        phase_result,
+        grid_transitions,
+        duration,
+        blocked_ranges,
+        left_label="C2 greedy",
+        right_label="C3 bidirectional",
+        comparison_name="P3-C2 vs P3-C3 phase refinement",
+    )
     write_grid_plot(
         file_output / f"{stem}__grid.png",
         audio_path.name,
@@ -3378,6 +3743,11 @@ def analyse_file(
     phase_grid_bpm = (
         np.concatenate(phase_grid_bpm_parts)
         if phase_grid_bpm_parts
+        else np.asarray([], dtype=float)
+    )
+    refinement_shifts = (
+        np.abs(phase_result.beat_times - greedy_phase_result.beat_times)
+        if len(phase_result.beat_times) == len(greedy_phase_result.beat_times)
         else np.asarray([], dtype=float)
     )
     scale_usage = []
@@ -3481,8 +3851,10 @@ def analyse_file(
         },
         "p3c_phase_grid": {
             "mode": args.grid_mode,
+            "phase_refinement": args.phase_refinement,
             "official_normalization_source": selected_grid.method,
             "legacy_beats_csv": paths["legacy_normalized"].name,
+            "greedy_phase_beats_csv": paths["phase_greedy"].name,
             "phase_aware_beats_csv": paths["phase_normalized"].name,
             "phase_grid_csv": paths["phase_events"].name,
             "grid_transitions_csv": paths["grid_transitions"].name,
@@ -3494,6 +3866,16 @@ def analyse_file(
             "phase_bridge_steps": sum(
                 item.transition_type == "phase_bridge"
                 for item in grid_transitions
+            ),
+            "bidirectional_bridge_windows": sum(
+                item.transition_type == "bidirectional_bridge"
+                for item in grid_transitions
+            ),
+            "refined_beats": int(np.sum(refinement_shifts > 1e-6)),
+            "maximum_refinement_seconds": (
+                round(float(np.max(refinement_shifts)), 6)
+                if len(refinement_shifts)
+                else 0.0
             ),
             "used_scales": sorted(
                 {float(item.selected_scale) for item in phase_events}
@@ -3606,6 +3988,16 @@ def build_parser() -> argparse.ArgumentParser:
             "P3-C grid mode: legacy keeps the old grid; preview writes a "
             "phase-aware alternative while keeping legacy official (default); "
             "phase-aware promotes the continuous-phase grid to normalized output"
+        ),
+    )
+    parser.add_argument(
+        "--phase-refinement",
+        choices=("greedy", "bidirectional"),
+        default="bidirectional",
+        help=(
+            "P3-C3 phase refinement: greedy keeps the C2 forward tracker; "
+            "bidirectional jointly optimizes bridge beats between stable anchors "
+            "(default)"
         ),
     )
     return parser
