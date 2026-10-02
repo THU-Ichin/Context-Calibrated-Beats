@@ -15,6 +15,8 @@ Its optional bidirectional pass jointly
 refines bridge beats and can use a stable future window to backtrack across an
 internally mis-phased region. P3-C4 validates that grid and falls back only to
 the validated greedy phase path, never to mechanical legacy normalization.
+P4 adds CSV-backed reliability labels and a unified diagnostic plot without
+changing any beat in the validated grid.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -145,6 +147,22 @@ class ActivitySegment:
     no_beat: bool
     source: str = "default"
     note: str = ""
+
+
+@dataclass
+class ReliabilitySegment:
+    segment_id: int
+    activity_segment_id: int
+    start_seconds: float
+    end_seconds: float
+    classification: str
+    reliability_score: float
+    reference_bpm: float | None
+    local_bpm: float | None
+    acoustic_support: float
+    scale_switches: int
+    phase_repairs: int
+    reason: str
 
 
 @dataclass
@@ -2678,6 +2696,374 @@ def read_grid_transitions_csv(path: Path) -> list[GridTransition]:
     ]
 
 
+def build_reliability_segments(
+    phase_events: list[PhaseGridEvent],
+    transitions: list[GridTransition],
+    diagnostics: list[IntervalDiagnostic],
+    active_ranges: list[tuple[float, float]],
+    blocked_ranges: list[tuple[float, float]],
+    activity_segments: list[ActivitySegment] | None = None,
+    bin_seconds: float = 2.0,
+) -> list[ReliabilitySegment]:
+    """Describe where the final grid is trustworthy without changing it.
+
+    P4 deliberately consumes only persisted diagnostic products.  Its labels
+    are an audit aid, not another beat-repair stage.
+    """
+    interval_midpoints: list[float] = []
+    interval_bpms: list[float] = []
+    for activity_id in sorted({item.activity_segment_id for item in phase_events}):
+        times = np.asarray(
+            [
+                item.beat_time_seconds
+                for item in phase_events
+                if item.activity_segment_id == activity_id
+            ],
+            dtype=float,
+        )
+        if len(times) < 2:
+            continue
+        intervals = np.diff(times)
+        interval_midpoints.extend((times[:-1] + intervals / 2.0).tolist())
+        interval_bpms.extend((60.0 / intervals).tolist())
+    reference_bpm = modal_tempo(
+        np.asarray(interval_midpoints, dtype=float),
+        np.asarray(interval_bpms, dtype=float),
+        NORMALIZED_BPM_MIN,
+        NORMALIZED_BPM_MAX,
+    )
+
+    bins: list[ReliabilitySegment] = []
+    repair_sources = {"bidirectional_refined", "future_confirmed_backtrack"}
+    repair_transitions = {"bidirectional_bridge", "future_confirmed_backtrack"}
+    for activity_id, (range_start, range_end) in enumerate(active_ranges):
+        local_events = [
+            item
+            for item in phase_events
+            if item.activity_segment_id == activity_id
+        ]
+        event_times = np.asarray(
+            [item.beat_time_seconds for item in local_events], dtype=float
+        )
+        if len(event_times) >= 2:
+            periods = np.diff(event_times)
+            period_midpoints = event_times[:-1] + periods / 2.0
+        else:
+            periods = np.asarray([], dtype=float)
+            period_midpoints = np.asarray([], dtype=float)
+
+        start = range_start
+        while start < range_end - 1e-9:
+            end = min(start + bin_seconds, range_end)
+            event_subset = [
+                item
+                for item in local_events
+                if start <= item.beat_time_seconds < end
+            ]
+            period_subset = periods[
+                (period_midpoints >= start) & (period_midpoints < end)
+            ]
+            local_bpm = (
+                float(60.0 / np.median(period_subset))
+                if len(period_subset)
+                else None
+            )
+            interval_cv = (
+                float(np.std(period_subset) / np.mean(period_subset))
+                if len(period_subset) >= 2 and np.mean(period_subset) > 0
+                else 0.0
+            )
+            acoustic_support = (
+                float(
+                    np.mean(
+                        [
+                            max(item.beat_probability, item.downbeat_probability)
+                            >= 0.45
+                            for item in event_subset
+                        ]
+                    )
+                )
+                if event_subset
+                else 0.0
+            )
+            local_transitions = [
+                item
+                for item in transitions
+                if item.activity_segment_id == activity_id
+                and item.end_seconds > start
+                and item.start_seconds < end
+            ]
+            scale_switches = sum(
+                item.transition_type == "scale_switch"
+                for item in local_transitions
+            )
+            bridge_steps = sum(
+                item.transition_type == "phase_bridge"
+                for item in local_transitions
+            )
+            phase_repairs = sum(
+                item.event_source in repair_sources for item in event_subset
+            ) + sum(
+                item.transition_type in repair_transitions
+                for item in local_transitions
+            )
+            local_diagnostics = [
+                item
+                for item in diagnostics
+                if item.activity_segment_id == activity_id
+                and start <= item.midpoint_seconds < end
+            ]
+            protected_ratio = (
+                sum(
+                    item.classification == "protected_tempo_motion"
+                    for item in local_diagnostics
+                )
+                / len(local_diagnostics)
+                if local_diagnostics
+                else 0.0
+            )
+            outlier_ratio = (
+                sum(
+                    item.classification
+                    in {"strong_outlier", "structural_evidence_required"}
+                    for item in local_diagnostics
+                )
+                / len(local_diagnostics)
+                if local_diagnostics
+                else 0.0
+            )
+            bpm_deviation = (
+                abs(local_bpm - reference_bpm) / reference_bpm
+                if local_bpm is not None and np.isfinite(reference_bpm)
+                else 0.0
+            )
+            stability = float(np.clip(1.0 - interval_cv / 0.12, 0.0, 1.0))
+            reasons: list[str] = []
+
+            is_tempo_motion = (
+                protected_ratio >= 0.30
+                and interval_cv < 0.12
+                and scale_switches <= 1
+            )
+            structural_unreliable = (
+                (
+                    scale_switches >= 2
+                    and (acoustic_support < 0.75 or interval_cv >= 0.08)
+                )
+                or interval_cv >= 0.10
+                or (bridge_steps >= 2 and acoustic_support < 0.55)
+            )
+            evidence_unreliable = (
+                (bpm_deviation >= 0.15 and acoustic_support < 0.60)
+                or (outlier_ratio >= 0.45 and acoustic_support < 0.55)
+            )
+            unreliable = structural_unreliable or (
+                evidence_unreliable and not is_tempo_motion
+            )
+            if unreliable:
+                classification = "BEAT_THIS_UNRELIABLE"
+                risk = max(
+                    min(1.0, scale_switches / 2.0),
+                    min(1.0, interval_cv / 0.12),
+                    min(1.0, bpm_deviation / 0.25)
+                    * (1.0 - 0.5 * acoustic_support),
+                    outlier_ratio * (1.0 - 0.4 * acoustic_support),
+                )
+                score = float(np.clip(0.50 * (1.0 - risk), 0.05, 0.49))
+                if scale_switches:
+                    reasons.append(f"{scale_switches} grid-scale switch(es)")
+                if interval_cv >= 0.10:
+                    reasons.append(f"interval variation {100.0 * interval_cv:.1f}%")
+                if bpm_deviation >= 0.15:
+                    reasons.append(
+                        f"local BPM differs {100.0 * bpm_deviation:.1f}% from dominant"
+                    )
+                if bridge_steps >= 2:
+                    reasons.append(f"{bridge_steps} phase bridges")
+                if outlier_ratio >= 0.45:
+                    reasons.append(f"P3-A outlier share {outlier_ratio:.2f}")
+            elif is_tempo_motion:
+                classification = "TEMPO_MOTION"
+                score = float(
+                    np.clip(0.55 + 0.25 * stability + 0.20 * acoustic_support, 0, 1)
+                )
+                reasons.append("coherent tempo motion protected by P3-A")
+            elif phase_repairs or bridge_steps:
+                classification = "PHASE_REPAIRED"
+                score = float(
+                    np.clip(0.58 + 0.22 * stability + 0.20 * acoustic_support, 0, 1)
+                )
+                reasons.append("phase-aware refinement or bridge was used")
+            else:
+                classification = "RELIABLE"
+                score = float(
+                    np.clip(0.55 + 0.30 * stability + 0.15 * acoustic_support, 0, 1)
+                )
+                reasons.append("stable normalized grid")
+
+            reasons.append(f"acoustic support {acoustic_support:.2f}")
+            bins.append(
+                ReliabilitySegment(
+                    segment_id=0,
+                    activity_segment_id=activity_id,
+                    start_seconds=float(start),
+                    end_seconds=float(end),
+                    classification=classification,
+                    reliability_score=score,
+                    reference_bpm=(
+                        float(reference_bpm) if np.isfinite(reference_bpm) else None
+                    ),
+                    local_bpm=local_bpm,
+                    acoustic_support=acoustic_support,
+                    scale_switches=scale_switches,
+                    phase_repairs=phase_repairs,
+                    reason="; ".join(reasons),
+                )
+            )
+            start = end
+
+    # A short non-red hole inside a longer suspect run is usually only a bin
+    # boundary artefact. Close up to four seconds, but never consume coherent
+    # tempo motion or cross an activity boundary.
+    index = 0
+    while index < len(bins):
+        if bins[index].classification != "BEAT_THIS_UNRELIABLE":
+            index += 1
+            continue
+        following = index + 1
+        while (
+            following < len(bins)
+            and bins[following].activity_segment_id == bins[index].activity_segment_id
+            and bins[following].classification != "BEAT_THIS_UNRELIABLE"
+        ):
+            following += 1
+        gap = bins[index + 1 : following]
+        if (
+            following < len(bins)
+            and bins[following].activity_segment_id == bins[index].activity_segment_id
+            and gap
+            and gap[-1].end_seconds - gap[0].start_seconds <= 4.0 + 1e-6
+            and all(item.classification != "TEMPO_MOTION" for item in gap)
+        ):
+            for item in gap:
+                item.classification = "BEAT_THIS_UNRELIABLE"
+                item.reliability_score = min(item.reliability_score, 0.49)
+                item.reason = "between adjacent unreliable windows; " + item.reason
+        index = max(index + 1, following)
+
+    note_segments = activity_segments or []
+    for start, end in blocked_ranges:
+        matching_notes = [
+            item.note
+            for item in note_segments
+            if item.no_beat
+            and item.end_seconds > start
+            and item.start_seconds < end
+            and item.note
+        ]
+        bins.append(
+            ReliabilitySegment(
+                segment_id=0,
+                activity_segment_id=-1,
+                start_seconds=float(start),
+                end_seconds=float(end),
+                classification="NO_BEAT",
+                reliability_score=1.0,
+                reference_bpm=(
+                    float(reference_bpm) if np.isfinite(reference_bpm) else None
+                ),
+                local_bpm=None,
+                acoustic_support=0.0,
+                scale_switches=0,
+                phase_repairs=0,
+                reason=(
+                    "user-marked NO_BEAT: " + " / ".join(dict.fromkeys(matching_notes))
+                    if matching_notes
+                    else "user-marked NO_BEAT interval"
+                ),
+            )
+        )
+
+    merged: list[ReliabilitySegment] = []
+    for item in sorted(bins, key=lambda value: (value.start_seconds, value.end_seconds)):
+        if (
+            merged
+            and merged[-1].classification == item.classification
+            and merged[-1].activity_segment_id == item.activity_segment_id
+            and abs(merged[-1].end_seconds - item.start_seconds) <= 1e-6
+        ):
+            previous = merged[-1]
+            old_duration = previous.end_seconds - previous.start_seconds
+            new_duration = item.end_seconds - item.start_seconds
+            total_duration = old_duration + new_duration
+            previous.end_seconds = item.end_seconds
+            previous.reliability_score = (
+                previous.reliability_score * old_duration
+                + item.reliability_score * new_duration
+            ) / total_duration
+            previous.acoustic_support = (
+                previous.acoustic_support * old_duration
+                + item.acoustic_support * new_duration
+            ) / total_duration
+            if previous.local_bpm is None:
+                previous.local_bpm = item.local_bpm
+            elif item.local_bpm is not None:
+                previous.local_bpm = (
+                    previous.local_bpm * old_duration + item.local_bpm * new_duration
+                ) / total_duration
+            previous.scale_switches += item.scale_switches
+            previous.phase_repairs += item.phase_repairs
+            clauses = list(dict.fromkeys((previous.reason + "; " + item.reason).split("; ")))
+            previous.reason = "; ".join(clauses[:8])
+        else:
+            merged.append(ReliabilitySegment(**asdict(item)))
+    for segment_id, item in enumerate(merged, start=1):
+        item.segment_id = segment_id
+    return merged
+
+
+def write_reliability_segments_csv(
+    path: Path, segments: list[ReliabilitySegment]
+) -> None:
+    fieldnames = list(ReliabilitySegment.__dataclass_fields__)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in segments:
+            row = asdict(item)
+            for field in ("start_seconds", "end_seconds"):
+                row[field] = f"{row[field]:.9f}"
+            row["reliability_score"] = f"{item.reliability_score:.6f}"
+            row["reference_bpm"] = _optional_number(item.reference_bpm, 4)
+            row["local_bpm"] = _optional_number(item.local_bpm, 4)
+            row["acoustic_support"] = f"{item.acoustic_support:.6f}"
+            writer.writerow(row)
+
+
+def read_reliability_segments_csv(path: Path) -> list[ReliabilitySegment]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    return [
+        ReliabilitySegment(
+            segment_id=int(row["segment_id"]),
+            activity_segment_id=int(row["activity_segment_id"]),
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+            classification=row["classification"],
+            reliability_score=float(row["reliability_score"]),
+            reference_bpm=(
+                float(row["reference_bpm"]) if row["reference_bpm"] else None
+            ),
+            local_bpm=float(row["local_bpm"]) if row["local_bpm"] else None,
+            acoustic_support=float(row["acoustic_support"]),
+            scale_switches=int(row["scale_switches"]),
+            phase_repairs=int(row["phase_repairs"]),
+            reason=row["reason"],
+        )
+        for row in rows
+    ]
+
+
 def write_beats_csv(
     path: Path,
     result: BeatResult,
@@ -3508,6 +3894,184 @@ def write_grid_plot(
     plt.close(fig)
 
 
+def write_p4_diagnostic_plot(
+    path: Path,
+    title: str,
+    frames: FramePredictions,
+    fused_result: BeatResult,
+    phase_result: BeatResult,
+    phase_events: list[PhaseGridEvent],
+    decoding: GridDecoding,
+    reliability: list[ReliabilitySegment],
+    duration: float,
+) -> None:
+    """Render P4's CSV-driven evidence and review ranges in one figure."""
+    fig, axes = plt.subplots(4, 1, figsize=(15, 11.5), sharex=True)
+    colours = {
+        "RELIABLE": "tab:green",
+        "PHASE_REPAIRED": "tab:blue",
+        "TEMPO_MOTION": "tab:orange",
+        "NO_BEAT": "0.45",
+        "BEAT_THIS_UNRELIABLE": "tab:red",
+    }
+    alphas = {
+        "RELIABLE": 0.025,
+        "PHASE_REPAIRED": 0.09,
+        "TEMPO_MOTION": 0.11,
+        "NO_BEAT": 0.16,
+        "BEAT_THIS_UNRELIABLE": 0.15,
+    }
+    shown: set[str] = set()
+    for item in reliability:
+        for ax in axes:
+            ax.axvspan(
+                item.start_seconds,
+                item.end_seconds,
+                color=colours[item.classification],
+                alpha=alphas[item.classification],
+                label=(
+                    item.classification
+                    if item.classification not in shown and ax is axes[0]
+                    else None
+                ),
+            )
+        shown.add(item.classification)
+
+    frame_times = np.arange(len(frames.fused_beat_logits), dtype=float) / frames.fps
+    axes[0].plot(
+        frame_times,
+        expit(frames.fused_beat_logits),
+        color="tab:blue",
+        linewidth=0.7,
+        alpha=0.8,
+        label="fused beat probability",
+    )
+    axes[0].plot(
+        frame_times,
+        expit(frames.fused_downbeat_logits),
+        color="tab:purple",
+        linewidth=0.6,
+        alpha=0.55,
+        label="fused downbeat probability",
+    )
+    axes[0].set_ylim(-0.02, 1.02)
+    axes[0].set_ylabel("Probability")
+
+    axes[1].scatter(
+        fused_result.beat_times,
+        np.ones(len(fused_result.beat_times)),
+        marker="|",
+        s=42,
+        color="0.25",
+        alpha=0.6,
+        label="Beat This! fused",
+    )
+    ordinary_times = np.asarray(
+        [
+            item.beat_time_seconds
+            for item in phase_events
+            if item.event_source
+            not in {"bidirectional_refined", "future_confirmed_backtrack"}
+        ],
+        dtype=float,
+    )
+    repaired_times = np.asarray(
+        [
+            item.beat_time_seconds
+            for item in phase_events
+            if item.event_source
+            in {"bidirectional_refined", "future_confirmed_backtrack"}
+        ],
+        dtype=float,
+    )
+    axes[1].scatter(
+        ordinary_times,
+        np.zeros(len(ordinary_times)),
+        marker="|",
+        s=48,
+        color="tab:green",
+        alpha=0.7,
+        label="final phase grid",
+    )
+    if len(repaired_times):
+        axes[1].scatter(
+            repaired_times,
+            np.zeros(len(repaired_times)),
+            marker="|",
+            s=65,
+            color="tab:blue",
+            label="phase-refined event",
+        )
+    axes[1].set_yticks([0, 1], ["final grid", "fused"])
+    axes[1].set_ylim(-0.55, 1.55)
+
+    bpm_label_used = False
+    reference_values = [
+        item.reference_bpm for item in reliability if item.reference_bpm is not None
+    ]
+    for activity_id in sorted({item.activity_segment_id for item in phase_events}):
+        times = np.asarray(
+            [
+                item.beat_time_seconds
+                for item in phase_events
+                if item.activity_segment_id == activity_id
+            ],
+            dtype=float,
+        )
+        if len(times) < 2:
+            continue
+        periods = np.diff(times)
+        axes[2].plot(
+            times[:-1] + periods / 2.0,
+            60.0 / periods,
+            color="tab:green",
+            linewidth=0.85,
+            alpha=0.78,
+            label="final interval BPM" if not bpm_label_used else None,
+        )
+        bpm_label_used = True
+    if reference_values:
+        axes[2].axhline(
+            float(np.median(reference_values)),
+            color="black",
+            linestyle="--",
+            linewidth=0.9,
+            label=f"dominant {np.median(reference_values):.1f} BPM",
+        )
+    axes[2].axhspan(
+        NORMALIZED_BPM_MIN,
+        NORMALIZED_BPM_MAX,
+        color="tab:green",
+        alpha=0.035,
+    )
+    axes[2].set_ylim(110, 250)
+    axes[2].set_ylabel("BPM")
+
+    if len(decoding.interval_midpoints):
+        axes[3].step(
+            decoding.interval_midpoints,
+            decoding.selected_scale,
+            where="mid",
+            color="tab:blue",
+            linewidth=1.0,
+            label="selected grid scale",
+        )
+    axes[3].set_yticks(GRID_SCALES, [f"{scale:g}x" for scale in GRID_SCALES])
+    axes[3].set_ylabel("Grid scale")
+    axes[3].set_xlabel("Time (seconds)")
+
+    for ax in axes:
+        ax.set_xlim(0, duration)
+        ax.grid(alpha=0.2)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="upper right", fontsize=7, ncol=2)
+    fig.suptitle(f"{title} — P4 reliability diagnostics (does not alter beats)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def analyse_file(
     audio_path: Path,
     output_root: Path,
@@ -3542,6 +4106,9 @@ def analyse_file(
         ),
         "grid_transitions": (
             file_output / f"{stem}__beat-this__grid-transitions.csv"
+        ),
+        "reliability": (
+            file_output / f"{stem}__beat-this__reliability.csv"
         ),
         "normalized": file_output / f"{stem}__beat-this-normalized__beats.csv",
         "grid": file_output / f"{stem}__beat-this__grid.csv",
@@ -3750,6 +4317,16 @@ def analyse_file(
             "C4 persisted phase grid validation failed: "
             + "; ".join(persisted_validation_errors)
         )
+    reliability_segments = build_reliability_segments(
+        phase_events,
+        grid_transitions,
+        interval_diagnostics,
+        ranges,
+        blocked_ranges,
+        activity_segments,
+    )
+    write_reliability_segments_csv(paths["reliability"], reliability_segments)
+    reliability_segments = read_reliability_segments_csv(paths["reliability"])
     normalized_result = BeatResult(
         method="beat-this-normalized",
         beat_times=phase_result.beat_times.copy(),
@@ -3850,6 +4427,18 @@ def analyse_file(
         normalized_result,
         ranges,
         blocked_ranges,
+        duration,
+    )
+    p4_plot_path = file_output / f"{stem}__beat-this__p4-diagnostics.png"
+    write_p4_diagnostic_plot(
+        p4_plot_path,
+        audio_path.name,
+        frames,
+        fused_result,
+        phase_result,
+        phase_events,
+        grid_decoding,
+        reliability_segments,
         duration,
     )
 
@@ -4071,11 +4660,63 @@ def analyse_file(
                 )
             ),
         },
+        "p4_reliability": {
+            "changes_final_beat_grid": False,
+            "reliability_csv": paths["reliability"].name,
+            "diagnostic_plot": p4_plot_path.name,
+            "classification_counts": {
+                classification: sum(
+                    item.classification == classification
+                    for item in reliability_segments
+                )
+                for classification in (
+                    "RELIABLE",
+                    "PHASE_REPAIRED",
+                    "TEMPO_MOTION",
+                    "NO_BEAT",
+                    "BEAT_THIS_UNRELIABLE",
+                )
+            },
+            "classification_seconds": {
+                classification: round(
+                    sum(
+                        item.end_seconds - item.start_seconds
+                        for item in reliability_segments
+                        if item.classification == classification
+                    ),
+                    3,
+                )
+                for classification in (
+                    "RELIABLE",
+                    "PHASE_REPAIRED",
+                    "TEMPO_MOTION",
+                    "NO_BEAT",
+                    "BEAT_THIS_UNRELIABLE",
+                )
+            },
+            "recommended_review_ranges": [
+                {
+                    "start_seconds": round(item.start_seconds, 3),
+                    "end_seconds": round(item.end_seconds, 3),
+                    "classification": item.classification,
+                    "reliability_score": round(item.reliability_score, 3),
+                    "reason": item.reason,
+                }
+                for item in reliability_segments
+                if item.classification
+                in {"BEAT_THIS_UNRELIABLE", "TEMPO_MOTION"}
+            ],
+            "note": (
+                "P4 describes confidence and review ranges from persisted CSV "
+                "evidence. It does not add, remove, or move any beat."
+            ),
+        },
         "interpretation_note": (
             "All plots and reports are regenerated from saved CSV data. "
             "NO_BEAT ranges are excluded from clicks, tempo statistics, and grid decoding. "
             f"P3-B repair mode is {args.repair_mode}. "
             "P3-C4 phase-aware grid mode is the sole normalization path. "
+            "P4 reliability labels are diagnostic only and never modify that path. "
             "Highlighted tempo-change regions are candidates, not ground truth. "
             "Exact 2x/0.5x tempo changes are musically ambiguous; raw BPM remains in each beat CSV."
         ),

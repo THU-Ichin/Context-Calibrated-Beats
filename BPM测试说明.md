@@ -105,11 +105,15 @@ segment_id,start_seconds,end_seconds,no_beat,source,note
 - 对应的 `__clicks.wav`：raw/fused/normalized 三套试听文件，高音点击代表 downbeat；
 - `__beat-this__frames.csv`：50 FPS 的 raw/fused beat、downbeat logits 和概率；
 - `__beat-this__grid.csv`：每个区间的基础 BPM、选中倍率、归一化 BPM 和置信度；
+- `__beat-this__reliability.csv`：P4 按时间段汇总的结果可靠性、声学支持度、
+  倍率切换次数和建议复核原因；
 - `__inference.csv`：FPS、窗口、hop、采样率和音频路径等推理元数据；
 - `__segments.csv`：用户或模型提供的有效节拍/`NO_BEAT` 时间段；
 - `__tempo.png`：raw/fused/normalized 三套拍点计算出的局部 BPM 对比；
 - `__probabilities.png`：raw/fused 逐帧 beat/downbeat 概率对比；
 - `__grid.png`：基础 BPM、倍率决策 BPM、最终实际 BPM 和选中网格倍率；
+- `__beat-this__p4-diagnostics.png`：把模型概率、原始/最终拍点、最终 BPM、
+  网格倍率和可靠性区段放在同一时间轴上；
 - `__report.json`：主导 BPM 和疑似变速区间；
 - 根目录 `summary.csv`：所有歌曲的 raw/fused/normalized 汇总，并包含有效时长和
   `NO_BEAT` 时长。
@@ -125,6 +129,19 @@ C3 双向细化不会再经过旧版末端删拍/填拍规则。C4 在落盘前�
 活动区段归属、倍率合法性、`[120, 240)` 范围和相邻周期连续性；如果 C3
 细化没有通过校验，会回退到已经验证的 C2 贪心相位路径，而不会回退到旧版网格。
 P3-B 的修复结果仍会保存供诊断和试听，但不会作为正式网格的输入。
+
+P4 不再修改拍点，而是解释当前结果在哪些区段值得信任或需要人工复核。
+`__beat-this__reliability.csv` 使用五类标签：
+
+- `RELIABLE`：网格稳定，没有明显异常证据；
+- `PHASE_REPAIRED`：P3-C 使用了相位桥接或双向细化，结果可用但值得试听；
+- `TEMPO_MOTION`：检测到连贯的自然变速，不应当作单点尖峰删除；
+- `NO_BEAT`：用户在 `segments.csv` 中明确排除的区段；
+- `BEAT_THIS_UNRELIABLE`：倍率频繁切换、区间波动、低声学支持等证据表明
+  Beat This! 在该段可能不适用，建议人工试听或标成 `NO_BEAT`。
+
+这些标签和 `reliability_score` 只用于解释、筛选和后续用户界面展示，绝不会
+反过来增删或移动 `__beat-this-normalized__beats.csv` 中的拍点。
 
 ## 关于“瞬时 BPM”
 

@@ -444,6 +444,98 @@ class CsvPipelineTest(unittest.TestCase):
             any(item.event_source == "future_confirmed_backtrack" for item in refined)
         )
 
+    def test_p4_marks_scale_churn_as_unreliable_without_changing_beats(self) -> None:
+        times = np.arange(0.0, 12.01, 0.30)
+        events = [
+            bpm.PhaseGridEvent(
+                grid_beat_index=index + 1,
+                activity_segment_id=0,
+                beat_time_seconds=float(time_seconds),
+                selected_scale=1.0,
+                target_period_seconds=0.30,
+                predicted_time_seconds=float(time_seconds),
+                phase_residual_seconds=0.0,
+                beat_probability=0.20 if 4.0 <= time_seconds < 8.0 else 0.90,
+                downbeat_probability=0.0,
+                event_source="theoretical_grid" if 4.0 <= time_seconds < 8.0 else "acoustic_peak",
+                transition_type="stable",
+                path_cost=float(index),
+            )
+            for index, time_seconds in enumerate(times)
+        ]
+        transitions = [
+            bpm.GridTransition(
+                transition_id=index + 1,
+                activity_segment_id=0,
+                start_seconds=time_seconds - 0.2,
+                end_seconds=time_seconds,
+                previous_scale=1.0,
+                next_scale=0.5 if index % 2 == 0 else 1.0,
+                previous_period_seconds=0.30,
+                next_period_seconds=0.30,
+                phase_adjustment_seconds=0.0,
+                transition_type="scale_switch",
+                diagnostic_note="synthetic scale churn",
+            )
+            for index, time_seconds in enumerate((4.4, 4.8, 6.4, 6.8))
+        ]
+        original_times = np.asarray([item.beat_time_seconds for item in events])
+        reliability = bpm.build_reliability_segments(
+            events,
+            transitions,
+            [],
+            [(0.0, 12.0)],
+            [],
+        )
+
+        self.assertTrue(
+            any(
+                item.classification == "BEAT_THIS_UNRELIABLE"
+                and item.start_seconds <= 4.0
+                and item.end_seconds >= 8.0
+                for item in reliability
+            )
+        )
+        np.testing.assert_array_equal(
+            np.asarray([item.beat_time_seconds for item in events]), original_times
+        )
+
+    def test_p4_preserves_no_beat_as_a_separate_classification(self) -> None:
+        events = []
+        for activity_id, times in enumerate(
+            (np.arange(0.0, 3.0, 0.3), np.arange(5.0, 8.01, 0.3))
+        ):
+            events.extend(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=len(events) + 1,
+                    activity_segment_id=activity_id,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=1.0,
+                    target_period_seconds=0.30,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=0.90,
+                    downbeat_probability=0.0,
+                    event_source="acoustic_peak",
+                    transition_type="stable",
+                    path_cost=float(len(events)),
+                )
+                for time_seconds in times
+            )
+        reliability = bpm.build_reliability_segments(
+            events,
+            [],
+            [],
+            [(0.0, 3.0), (5.0, 8.0)],
+            [(3.0, 5.0)],
+            [bpm.ActivitySegment(1, 3.0, 5.0, True, "user", "silent bridge")],
+        )
+        no_beat = [item for item in reliability if item.classification == "NO_BEAT"]
+
+        self.assertEqual(len(no_beat), 1)
+        self.assertEqual((no_beat[0].start_seconds, no_beat[0].end_seconds), (3.0, 5.0))
+        self.assertIn("silent bridge", no_beat[0].reason)
+
 
 if __name__ == "__main__":
     unittest.main()
