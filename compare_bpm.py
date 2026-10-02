@@ -1150,6 +1150,113 @@ def _frame_index(time_seconds: float, frames: FramePredictions) -> int:
     )
 
 
+def _future_aligned_segment_start(
+    segment_times: np.ndarray,
+    period_at,
+    probabilities,
+) -> tuple[float, float, str] | None:
+    """Use a stable near-future lattice to disambiguate a segment's first beat.
+
+    This is intentionally a start-phase selector, not a general backtracker:
+    it may move the first grid event by less than one normalized period, but it
+    never inserts, removes, or rewrites the Beat This! source detections.
+    """
+    if len(segment_times) < 5:
+        return None
+    original_start = float(segment_times[0])
+    horizon_end = min(float(segment_times[-1]), original_start + 6.0)
+    anchors = np.asarray(
+        [
+            float(time_seconds)
+            for time_seconds in segment_times
+            if time_seconds <= horizon_end + 1e-9
+            and max(probabilities(float(time_seconds))) >= 0.45
+        ],
+        dtype=float,
+    )
+    if len(anchors) < 4:
+        return None
+
+    runs: list[np.ndarray] = []
+    run_start = 0
+    for index, interval in enumerate(np.diff(anchors)):
+        left = float(anchors[index])
+        right = float(anchors[index + 1])
+        period = float(np.clip(0.5 * (period_at(left) + period_at(right)), 1e-6, None))
+        steps = max(1, int(round(float(interval) / period)))
+        residual = abs(float(interval) - steps * period)
+        compatible = steps <= 4 and residual <= max(0.045, 0.14 * period)
+        if not compatible:
+            runs.append(anchors[run_start : index + 1])
+            run_start = index + 1
+    runs.append(anchors[run_start:])
+
+    candidates: list[tuple[float, int, float, float, float, str]] = []
+    for run in runs:
+        if len(run) < 4 or run[-1] - run[0] < 1.8:
+            continue
+        local_periods = np.asarray([period_at(float(item)) for item in run], dtype=float)
+        reference_period = float(np.median(local_periods))
+        if reference_period <= 0:
+            continue
+        if float(np.max(np.abs(local_periods - reference_period))) > 0.10 * reference_period:
+            continue
+        steps = np.maximum(1, np.rint(np.diff(run) / reference_period).astype(int))
+        positions = np.r_[0, np.cumsum(steps)].astype(float)
+        fitted_period, fitted_phase = np.polyfit(positions, run, 1)
+        fitted_period = float(fitted_period)
+        fitted_phase = float(fitted_phase)
+        if not 0.90 * reference_period <= fitted_period <= 1.10 * reference_period:
+            continue
+        fitted = fitted_phase + positions * fitted_period
+        residuals = np.abs(run - fitted)
+        if float(np.max(residuals)) > max(0.035, 0.11 * fitted_period):
+            continue
+        candidate_start = fitted_phase
+        while candidate_start - fitted_period >= original_start - 1e-9:
+            candidate_start -= fitted_period
+        while candidate_start < original_start - 1e-9:
+            candidate_start += fitted_period
+        shift = candidate_start - original_start
+        if shift <= max(0.055, 0.16 * fitted_period):
+            continue
+
+        def lattice_residual(time_seconds: float, phase: float) -> float:
+            lattice_step = round((time_seconds - phase) / fitted_period)
+            return abs(time_seconds - (phase + lattice_step * fitted_period))
+
+        old_error = float(
+            np.median(
+                [lattice_residual(float(item), original_start) for item in run]
+            )
+        )
+        new_error = float(
+            np.median(
+                [lattice_residual(float(item), candidate_start) for item in run]
+            )
+        )
+        improvement = old_error - new_error
+        if old_error < 0.22 * fitted_period or improvement < 0.15 * fitted_period:
+            continue
+        support = float(
+            np.mean([max(probabilities(float(item))) for item in run])
+        )
+        if support < 0.65:
+            continue
+        note = (
+            f"Stable future lattice at {run[0]:.3f}-{run[-1]:.3f}s "
+            f"moved segment start by {shift:.3f}s; "
+            f"median phase error {old_error:.3f}->{new_error:.3f}s"
+        )
+        candidates.append(
+            (new_error, -len(run), float(run[0]), candidate_start, fitted_period, note)
+        )
+    if not candidates:
+        return None
+    _, _, _, candidate_start, fitted_period, note = min(candidates)
+    return float(candidate_start), float(fitted_period), note
+
+
 def build_phase_aware_grid(
     repaired_result: BeatResult,
     frames: FramePredictions,
@@ -1218,9 +1325,17 @@ def build_phase_aware_grid(
                 )
             )
 
-        current = float(segment_times[0])
+        original_start = float(segment_times[0])
+        future_start = _future_aligned_segment_start(
+            segment_times,
+            period_at,
+            probabilities,
+        )
+        current = future_start[0] if future_start is not None else original_start
         current_scale = scale_at(current)
-        current_period = period_at(current)
+        current_period = (
+            future_start[1] if future_start is not None else period_at(current)
+        )
         beat_prob, downbeat_prob = probabilities(current)
         events.append(
             PhaseGridEvent(
@@ -1233,11 +1348,35 @@ def build_phase_aware_grid(
                 phase_residual_seconds=0.0,
                 beat_probability=beat_prob,
                 downbeat_probability=downbeat_prob,
-                event_source="acoustic_anchor",
-                transition_type="segment_start",
+                event_source=(
+                    "future_phase_start"
+                    if future_start is not None
+                    else "acoustic_anchor"
+                ),
+                transition_type=(
+                    "segment_start_future_phase"
+                    if future_start is not None
+                    else "segment_start"
+                ),
                 path_cost=path_cost,
             )
         )
+        if future_start is not None:
+            transitions.append(
+                GridTransition(
+                    transition_id=len(transitions) + 1,
+                    activity_segment_id=segment_id,
+                    start_seconds=original_start,
+                    end_seconds=current,
+                    previous_scale=scale_at(original_start),
+                    next_scale=current_scale,
+                    previous_period_seconds=period_at(original_start),
+                    next_period_seconds=current_period,
+                    phase_adjustment_seconds=current - original_start,
+                    transition_type="future_phase_start",
+                    diagnostic_note=future_start[2],
+                )
+            )
         if (
             len(source_downbeats)
             and np.min(np.abs(source_downbeats - current)) <= 0.07
@@ -2734,8 +2873,16 @@ def build_reliability_segments(
     )
 
     bins: list[ReliabilitySegment] = []
-    repair_sources = {"bidirectional_refined", "future_confirmed_backtrack"}
-    repair_transitions = {"bidirectional_bridge", "future_confirmed_backtrack"}
+    repair_sources = {
+        "bidirectional_refined",
+        "future_confirmed_backtrack",
+        "future_phase_start",
+    }
+    repair_transitions = {
+        "bidirectional_bridge",
+        "future_confirmed_backtrack",
+        "future_phase_start",
+    }
     for activity_id, (range_start, range_end) in enumerate(active_ranges):
         local_events = [
             item
@@ -2807,6 +2954,10 @@ def build_reliability_segments(
                 item.transition_type in repair_transitions
                 for item in local_transitions
             )
+            has_future_phase_start = any(
+                item.transition_type == "future_phase_start"
+                for item in local_transitions
+            )
             local_diagnostics = [
                 item
                 for item in diagnostics
@@ -2858,7 +3009,9 @@ def build_reliability_segments(
                 or (outlier_ratio >= 0.45 and acoustic_support < 0.55)
             )
             unreliable = structural_unreliable or (
-                evidence_unreliable and not is_tempo_motion
+                evidence_unreliable
+                and not is_tempo_motion
+                and not has_future_phase_start
             )
             if unreliable:
                 classification = "BEAT_THIS_UNRELIABLE"
@@ -3772,7 +3925,11 @@ def write_phase_grid_comparison_plot(
         )
     shown_transition = False
     for item in transitions:
-        if item.transition_type not in {"scale_switch", "phase_bridge"}:
+        if item.transition_type not in {
+            "scale_switch",
+            "phase_bridge",
+            "future_phase_start",
+        }:
             continue
         for ax in axes:
             ax.axvspan(
@@ -3971,7 +4128,11 @@ def write_p4_diagnostic_plot(
             item.beat_time_seconds
             for item in phase_events
             if item.event_source
-            not in {"bidirectional_refined", "future_confirmed_backtrack"}
+            not in {
+                "bidirectional_refined",
+                "future_confirmed_backtrack",
+                "future_phase_start",
+            }
         ],
         dtype=float,
     )
@@ -3980,7 +4141,11 @@ def write_p4_diagnostic_plot(
             item.beat_time_seconds
             for item in phase_events
             if item.event_source
-            in {"bidirectional_refined", "future_confirmed_backtrack"}
+            in {
+                "bidirectional_refined",
+                "future_confirmed_backtrack",
+                "future_phase_start",
+            }
         ],
         dtype=float,
     )
@@ -4603,6 +4768,10 @@ def analyse_file(
             ),
             "future_backtrack_windows": sum(
                 item.transition_type == "future_confirmed_backtrack"
+                for item in grid_transitions
+            ),
+            "future_phase_start_segments": sum(
+                item.transition_type == "future_phase_start"
                 for item in grid_transitions
             ),
             "future_backtracked_beats": sum(

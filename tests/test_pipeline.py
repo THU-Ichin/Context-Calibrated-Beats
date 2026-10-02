@@ -289,6 +289,70 @@ class CsvPipelineTest(unittest.TestCase):
         )
         self.assertEqual({item.activity_segment_id for item in events}, {0, 1})
 
+    def test_p3c_segment_start_uses_stable_future_phase(self) -> None:
+        source_times = np.asarray(
+            [0.52, 1.22, 2.08, 2.76, 3.46, 4.16, 4.86, 5.54]
+        )
+        logits = np.full(600, -6.0)
+        for time_seconds in source_times:
+            logits[round(time_seconds * self.fps)] = 6.0
+        frames = bpm.FramePredictions(
+            fps=self.fps,
+            raw_beat_logits=logits.copy(),
+            raw_downbeat_logits=np.full_like(logits, -6.0),
+            fused_beat_logits=logits.copy(),
+            fused_downbeat_logits=np.full_like(logits, -6.0),
+            window_seconds=30.0,
+            hop_seconds=10.0,
+            overlap_windows=1,
+        )
+
+        result, events, transitions = bpm.build_phase_aware_grid(
+            bpm.BeatResult("beat-this-fused", source_times),
+            frames,
+            [(0.0, 6.0)],
+        )
+
+        self.assertAlmostEqual(result.beat_times[0], 0.68, delta=0.03)
+        self.assertEqual(events[0].event_source, "future_phase_start")
+        self.assertTrue(
+            any(item.transition_type == "future_phase_start" for item in transitions)
+        )
+        future_reference = np.arange(0.68, 3.49, 0.35)
+        np.testing.assert_allclose(
+            result.beat_times[: len(future_reference)],
+            future_reference,
+            atol=0.04,
+        )
+
+    def test_p3c_segment_start_keeps_an_already_aligned_anchor(self) -> None:
+        source_times = np.arange(0.20, 5.81, 0.70)
+        logits = np.full(600, -6.0)
+        for time_seconds in source_times:
+            logits[round(time_seconds * self.fps)] = 6.0
+        frames = bpm.FramePredictions(
+            fps=self.fps,
+            raw_beat_logits=logits.copy(),
+            raw_downbeat_logits=np.full_like(logits, -6.0),
+            fused_beat_logits=logits.copy(),
+            fused_downbeat_logits=np.full_like(logits, -6.0),
+            window_seconds=30.0,
+            hop_seconds=10.0,
+            overlap_windows=1,
+        )
+
+        result, events, transitions = bpm.build_phase_aware_grid(
+            bpm.BeatResult("beat-this-fused", source_times),
+            frames,
+            [(0.0, 6.0)],
+        )
+
+        self.assertAlmostEqual(result.beat_times[0], 0.20, places=6)
+        self.assertEqual(events[0].event_source, "acoustic_anchor")
+        self.assertFalse(
+            any(item.transition_type == "future_phase_start" for item in transitions)
+        )
+
     def test_p3c_bidirectional_refinement_uses_both_fixed_anchors(self) -> None:
         times = np.asarray([0.00, 0.36, 0.76, 1.16, 1.52])
         logits = np.full(600, -6.0)
