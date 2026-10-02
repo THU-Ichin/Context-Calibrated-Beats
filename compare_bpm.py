@@ -13,7 +13,8 @@ those candidates into a traceable repaired-beat proposal. Preview mode keeps
 the proposal out of grid normalisation; conservative mode uses its saved CSV.
 P3-C adds a phase-continuous five-scale grid beside the legacy decoder and can
 promote that saved preview to the official normalized output. Its optional
-bidirectional pass jointly refines bridge beats between stable anchors.
+bidirectional pass jointly refines bridge beats and can use a stable future
+window to backtrack across an internally mis-phased region.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -1689,7 +1690,7 @@ def refine_phase_grid_bidirectionally(
     transitions: list[GridTransition],
     frames: FramePredictions,
 ) -> tuple[BeatResult, list[PhaseGridEvent], list[GridTransition]]:
-    """Jointly refine bridge beats between stable past and future anchors."""
+    """Refine bridge beats and backtrack from independently stable future phase."""
     refined = [PhaseGridEvent(**asdict(item)) for item in events]
     refined_transitions = [GridTransition(**asdict(item)) for item in transitions]
     minimum_period = 60.0 / NORMALIZED_BPM_MAX + 1e-4
@@ -1939,6 +1940,273 @@ def refine_phase_grid_bidirectionally(
                 )
             )
 
+    # A fixed-anchor bridge cannot repair a longer region that has locked to a
+    # coherent but wrong phase, especially when the wrong path also contains a
+    # missing beat. Look beyond each remaining transition for an independently
+    # stable, acoustically supported future window, fit its phase, and project
+    # that phase backwards until it reconnects with a compatible past run.
+    # This pass may therefore change the number of events in the suspect span.
+    future_window_seconds = 4.0
+    maximum_future_window_seconds = 5.2
+    maximum_backtrack_seconds = 8.0
+
+    def is_unstable(item: PhaseGridEvent) -> bool:
+        return (
+            item.event_source in {"phase_bridge", "bidirectional_refined"}
+            or item.transition_type
+            in {"phase_bridge", "scale_switch", "bidirectional_bridge"}
+        )
+
+    def fit_stable_future(
+        segment: list[PhaseGridEvent], start: int
+    ) -> tuple[int, float, float, float] | None:
+        if start >= len(segment):
+            return None
+        stop = start + 1
+        while stop < len(segment):
+            if is_unstable(segment[stop]):
+                return None
+            span = segment[stop].beat_time_seconds - segment[start].beat_time_seconds
+            stop += 1
+            if span >= future_window_seconds:
+                break
+            if span > maximum_future_window_seconds:
+                return None
+        if stop - start < 9:
+            return None
+        future = segment[start:stop]
+        times = np.asarray([item.beat_time_seconds for item in future], dtype=float)
+        if times[-1] - times[0] < future_window_seconds:
+            return None
+        positions = np.arange(len(times), dtype=float)
+        period, phase_at_start = np.polyfit(positions, times, 1)
+        period = float(period)
+        phase_at_start = float(phase_at_start)
+        if not minimum_period <= period <= maximum_period:
+            return None
+        residuals = times - (phase_at_start + positions * period)
+        intervals = np.diff(times)
+        if (
+            float(np.max(np.abs(residuals))) > max(0.035, 0.12 * period)
+            or float(np.max(np.abs(intervals - period) / period)) > 0.16
+            or _robust_stability(intervals) < 0.75
+        ):
+            return None
+        acoustic_support = float(
+            np.mean(
+                [
+                    item.event_source == "acoustic_peak"
+                    and item.beat_probability >= 0.45
+                    for item in future
+                ]
+            )
+        )
+        if acoustic_support < 0.65:
+            return None
+        future_scales = {item.selected_scale for item in future}
+        if len(future_scales) != 1:
+            return None
+        return stop, period, phase_at_start, _robust_stability(intervals)
+
+    def lattice_residual(time_seconds: float, phase: float, period: float) -> float:
+        step = round((time_seconds - phase) / period)
+        return abs(time_seconds - (phase + step * period))
+
+    rebuilt: list[PhaseGridEvent] = []
+    segment_ids = sorted({item.activity_segment_id for item in refined})
+    for segment_id in segment_ids:
+        segment = [
+            item for item in refined if item.activity_segment_id == segment_id
+        ]
+        for _ in range(6):
+            unstable_positions = [
+                index for index, item in enumerate(segment) if is_unstable(item)
+            ]
+            if not unstable_positions:
+                break
+            runs = np.split(
+                np.asarray(unstable_positions, dtype=int),
+                np.flatnonzero(np.diff(unstable_positions) > 1) + 1,
+            )
+            repaired_run = False
+            for run in reversed(runs):
+                if not len(run):
+                    continue
+                run_start = int(run[0])
+                run_end = int(run[-1])
+                future_start = run_end + 1
+                future_fit = fit_stable_future(segment, future_start)
+                if future_fit is None:
+                    continue
+                _, future_period, future_phase, future_stability = (
+                    future_fit
+                )
+
+                past_candidates = [
+                    index
+                    for index in range(run_start)
+                    if segment[run_start].beat_time_seconds
+                    - segment[index].beat_time_seconds
+                    <= maximum_backtrack_seconds
+                ]
+                if len(past_candidates) < 6:
+                    continue
+                # Use the decoder's intended periods here. The observed past
+                # intervals are precisely what may have been stretched while a
+                # beat was missing, so using them would veto the needed repair.
+                past_periods = np.asarray(
+                    [
+                        segment[index].target_period_seconds
+                        for index in past_candidates
+                    ],
+                    dtype=float,
+                )
+                recent_past_periods = past_periods[-min(len(past_periods), 12) :]
+                past_period = float(np.median(recent_past_periods))
+                if (
+                    _robust_stability(recent_past_periods) < 0.65
+                    or abs(past_period - future_period) / future_period > 0.06
+                ):
+                    continue
+
+                compatibility_limit = max(0.045, 0.20 * future_period)
+                anchor: int | None = None
+                for candidate in reversed(past_candidates):
+                    if candidate < 2:
+                        continue
+                    confirmation = segment[candidate - 2 : candidate + 1]
+                    confirmation_times = np.asarray(
+                        [item.beat_time_seconds for item in confirmation], dtype=float
+                    )
+                    if any(
+                        lattice_residual(time_seconds, future_phase, future_period)
+                        > compatibility_limit
+                        for time_seconds in confirmation_times
+                    ):
+                        continue
+                    confirmation_intervals = np.diff(confirmation_times)
+                    if np.max(
+                        np.abs(confirmation_intervals - future_period)
+                        / future_period
+                    ) > 0.10:
+                        continue
+                    anchor = candidate
+                    break
+                if anchor is None:
+                    continue
+
+                old_middle = segment[anchor + 1 : future_start]
+                if len(old_middle) < 3:
+                    continue
+                old_residuals = np.asarray(
+                    [
+                        lattice_residual(
+                            item.beat_time_seconds, future_phase, future_period
+                        )
+                        for item in old_middle
+                    ],
+                    dtype=float,
+                )
+                interval_count = int(
+                    round(
+                        (
+                            segment[future_start].beat_time_seconds
+                            - segment[anchor].beat_time_seconds
+                        )
+                        / future_period
+                    )
+                )
+                if interval_count < 2:
+                    continue
+                expected_middle_count = interval_count - 1
+                clearly_misphased = (
+                    int(np.sum(old_residuals > 0.25 * future_period)) >= 3
+                    and float(np.max(old_residuals)) > 0.35 * future_period
+                )
+                count_mismatch = expected_middle_count != len(old_middle)
+                if not clearly_misphased and not count_mismatch:
+                    continue
+
+                left_time = segment[anchor].beat_time_seconds
+                right_time = segment[future_start].beat_time_seconds
+                corrected_period = (right_time - left_time) / interval_count
+                if (
+                    not minimum_period <= corrected_period <= maximum_period
+                    or abs(corrected_period - future_period) / future_period > 0.06
+                ):
+                    continue
+                projected_times = left_time + corrected_period * np.arange(
+                    1, interval_count, dtype=float
+                )
+                templates = old_middle or [segment[anchor], segment[future_start]]
+                replacement: list[PhaseGridEvent] = []
+                for projected_time in projected_times:
+                    template = min(
+                        templates,
+                        key=lambda item: abs(
+                            item.beat_time_seconds - float(projected_time)
+                        ),
+                    )
+                    beat_prob, downbeat_prob = probabilities(float(projected_time))
+                    replacement.append(
+                        PhaseGridEvent(
+                            grid_beat_index=template.grid_beat_index,
+                            activity_segment_id=segment_id,
+                            beat_time_seconds=float(projected_time),
+                            selected_scale=segment[future_start].selected_scale,
+                            target_period_seconds=float(corrected_period),
+                            predicted_time_seconds=float(projected_time),
+                            phase_residual_seconds=0.0,
+                            beat_probability=beat_prob,
+                            downbeat_probability=downbeat_prob,
+                            event_source="future_confirmed_backtrack",
+                            transition_type="future_backtrack",
+                            path_cost=template.path_cost,
+                        )
+                    )
+
+                nearest_shifts = [
+                    min(
+                        abs(item.beat_time_seconds - float(projected_time))
+                        for projected_time in projected_times
+                    )
+                    for item in old_middle
+                ]
+                refined_transitions.append(
+                    GridTransition(
+                        transition_id=len(refined_transitions) + 1,
+                        activity_segment_id=segment_id,
+                        start_seconds=left_time,
+                        end_seconds=right_time,
+                        previous_scale=segment[anchor].selected_scale,
+                        next_scale=segment[future_start].selected_scale,
+                        previous_period_seconds=past_period,
+                        next_period_seconds=float(corrected_period),
+                        phase_adjustment_seconds=(
+                            float(max(nearest_shifts)) if nearest_shifts else 0.0
+                        ),
+                        transition_type="future_confirmed_backtrack",
+                        diagnostic_note=(
+                            "Stable future phase was projected backwards; "
+                            f"future_stability={future_stability:.3f}, "
+                            f"events={len(old_middle)}->{len(replacement)}"
+                        ),
+                    )
+                )
+                segment = (
+                    segment[: anchor + 1]
+                    + replacement
+                    + segment[future_start:]
+                )
+                repaired_run = True
+                break
+            if not repaired_run:
+                break
+        rebuilt.extend(segment)
+    refined = rebuilt
+    for grid_index, item in enumerate(refined, start=1):
+        item.grid_beat_index = grid_index
+
     output_times = np.asarray([item.beat_time_seconds for item in refined], dtype=float)
     if len(output_times) > 1 and np.any(np.diff(output_times) <= 0):
         raise ValueError("Bidirectional phase refinement broke time ordering")
@@ -1974,7 +2242,7 @@ def refine_phase_grid_bidirectionally(
         beat_times=output_times,
         downbeat_times=output_downbeats,
         note=(
-            "P3-C bidirectionally refined phase grid between stable anchors"
+            "P3-C bidirectional phase grid with future-confirmed backtracking"
         ),
     )
     return result, refined, refined_transitions
@@ -3745,11 +4013,19 @@ def analyse_file(
         if phase_grid_bpm_parts
         else np.asarray([], dtype=float)
     )
-    refinement_shifts = (
-        np.abs(phase_result.beat_times - greedy_phase_result.beat_times)
-        if len(phase_result.beat_times) == len(greedy_phase_result.beat_times)
-        else np.asarray([], dtype=float)
-    )
+    if len(phase_result.beat_times) and len(greedy_phase_result.beat_times):
+        # Nearest-neighbour displacement remains meaningful when future
+        # backtracking inserts or removes a beat; elementwise subtraction does
+        # not. The explicit event counters below retain the exact audit trail.
+        refinement_shifts = np.min(
+            np.abs(
+                phase_result.beat_times[:, np.newaxis]
+                - greedy_phase_result.beat_times[np.newaxis, :]
+            ),
+            axis=1,
+        )
+    else:
+        refinement_shifts = np.asarray([], dtype=float)
     scale_usage = []
     for scale in GRID_SCALES:
         mask = grid_decoding.selected_scale == scale
@@ -3870,6 +4146,17 @@ def analyse_file(
             "bidirectional_bridge_windows": sum(
                 item.transition_type == "bidirectional_bridge"
                 for item in grid_transitions
+            ),
+            "future_backtrack_windows": sum(
+                item.transition_type == "future_confirmed_backtrack"
+                for item in grid_transitions
+            ),
+            "future_backtracked_beats": sum(
+                item.event_source == "future_confirmed_backtrack"
+                for item in phase_events
+            ),
+            "event_count_change_from_greedy": (
+                len(phase_result.beat_times) - len(greedy_phase_result.beat_times)
             ),
             "refined_beats": int(np.sum(refinement_shifts > 1e-6)),
             "maximum_refinement_seconds": (
@@ -3996,8 +4283,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="bidirectional",
         help=(
             "P3-C3 phase refinement: greedy keeps the C2 forward tracker; "
-            "bidirectional jointly optimizes bridge beats between stable anchors "
-            "(default)"
+            "bidirectional jointly optimizes bridge beats and backtracks from "
+            "independently stable future phase (default)"
         ),
     )
     return parser

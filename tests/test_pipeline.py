@@ -337,6 +337,74 @@ class CsvPipelineTest(unittest.TestCase):
         self.assertTrue(np.all(intervals > 60.0 / bpm.NORMALIZED_BPM_MAX))
         self.assertTrue(np.all(intervals <= 60.0 / bpm.NORMALIZED_BPM_MIN))
 
+    def test_p3c_future_window_backtracks_and_restores_missing_beat(self) -> None:
+        period = 0.34
+        correct_grid = np.arange(0.0, 12.01, period)
+        past = correct_grid[correct_grid <= 3.40 + 1e-9]
+        wrong_phase = np.linspace(3.90, 6.62, 8)
+        bridges = np.asarray([6.96, 7.22])
+        future = correct_grid[correct_grid >= 7.48 - 1e-9]
+        times = np.concatenate((past, wrong_phase, bridges, future))
+
+        logits = np.full(round(12.5 * self.fps), -6.0)
+        for time_seconds in correct_grid:
+            logits[round(time_seconds * self.fps)] = 6.0
+        frames = bpm.FramePredictions(
+            fps=self.fps,
+            raw_beat_logits=logits.copy(),
+            raw_downbeat_logits=np.full_like(logits, -6.0),
+            fused_beat_logits=logits.copy(),
+            fused_downbeat_logits=np.full_like(logits, -6.0),
+            window_seconds=30.0,
+            hop_seconds=10.0,
+            overlap_windows=1,
+        )
+        events = []
+        for index, time_seconds in enumerate(times):
+            is_bridge = time_seconds in bridges
+            events.append(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=index + 1,
+                    activity_segment_id=0,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=1.0,
+                    target_period_seconds=period,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=(
+                        0.01 if is_bridge else float(time_seconds >= 7.48)
+                    ),
+                    downbeat_probability=0.0,
+                    event_source="phase_bridge" if is_bridge else "acoustic_peak",
+                    transition_type="phase_bridge" if is_bridge else "stable",
+                    path_cost=float(index),
+                )
+            )
+
+        result, refined, transitions = bpm.refine_phase_grid_bidirectionally(
+            bpm.BeatResult("beat-this-phase-aware", times),
+            events,
+            [],
+            frames,
+        )
+        self.assertEqual(len(result.beat_times), len(times) + 1)
+        corrected = result.beat_times[
+            (result.beat_times > 3.40) & (result.beat_times < 7.48)
+        ]
+        residuals = np.abs(
+            corrected / period - np.round(corrected / period)
+        ) * period
+        self.assertLess(float(np.max(residuals)), 0.02)
+        self.assertTrue(
+            any(
+                item.transition_type == "future_confirmed_backtrack"
+                for item in transitions
+            )
+        )
+        self.assertTrue(
+            any(item.event_source == "future_confirmed_backtrack" for item in refined)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
