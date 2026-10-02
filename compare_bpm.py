@@ -9,12 +9,12 @@ For every input file, this script writes the official raw and overlap-fused:
   * a CSV summary and a JSON report of possible tempo-change regions.
 
 P3-A writes interval diagnostics and broad repair candidates. P3-B adjudicates
-those candidates into a traceable repaired-beat proposal. Preview mode keeps
-the proposal out of grid normalisation; conservative mode uses its saved CSV.
-P3-C adds a phase-continuous five-scale grid beside the legacy decoder and can
-promote that saved preview to the official normalized output. Its optional
-bidirectional pass jointly refines bridge beats and can use a stable future
-window to backtrack across an internally mis-phased region.
+those candidates into a traceable audition-only repaired-beat proposal.
+P3-C adds a phase-continuous five-scale grid as the official normalized output.
+Its optional bidirectional pass jointly
+refines bridge beats and can use a stable future window to backtrack across an
+internally mis-phased region. P3-C4 validates that grid and falls back only to
+the validated greedy phase path, never to mechanical legacy normalization.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -1132,284 +1132,6 @@ def _frame_index(time_seconds: float, frames: FramePredictions) -> int:
     )
 
 
-def _build_normalized_grid_segment(
-    fused_result: BeatResult,
-    frames: FramePredictions,
-    snap_radius_seconds: float = 0.08,
-) -> tuple[BeatResult, GridDecoding]:
-    """Build a normalized grid for one contiguous beat-active segment."""
-    beat_times = np.asarray(fused_result.beat_times, dtype=float)
-    midpoints, _, base_bpm = local_tempo(beat_times)
-    if len(beat_times) < 2 or not len(base_bpm):
-        empty = np.asarray([], dtype=float)
-        return (
-            BeatResult(
-                method="beat-this-normalized",
-                beat_times=beat_times.copy(),
-                downbeat_times=np.asarray([], dtype=float),
-                note="Insufficient beats for metrical-level normalization",
-            ),
-            GridDecoding(empty, empty, empty, empty, empty, empty, empty),
-        )
-
-    states, confidence = decode_grid_scales(base_bpm)
-    selected_scale = GRID_SCALES[states]
-    normalized_bpm = base_bpm * selected_scale
-    segment_id = np.r_[0, np.cumsum(states[1:] != states[:-1])].astype(int)
-    beat_probability = expit(frames.fused_beat_logits)
-    downbeat_probability = expit(frames.fused_downbeat_logits)
-    radius_frames = max(1, round(snap_radius_seconds * frames.fps))
-
-    def evidence(time_seconds: float) -> float:
-        index = _frame_index(time_seconds, frames)
-        return float(
-            beat_probability[index] + 0.2 * downbeat_probability[index]
-        )
-
-    def snap_inserted_beat(time_seconds: float) -> tuple[float, float]:
-        center = _frame_index(time_seconds, frames)
-        left = max(0, center - radius_frames)
-        right = min(len(beat_probability), center + radius_frames + 1)
-        best = left + int(np.argmax(frames.fused_beat_logits[left:right]))
-        if beat_probability[best] >= 0.5:
-            return best / frames.fps, evidence(best / frames.fps)
-        return time_seconds, evidence(time_seconds)
-
-    candidates: list[tuple[float, float]] = []
-    segment_starts = np.r_[0, np.flatnonzero(states[1:] != states[:-1]) + 1]
-    segment_ends = np.r_[segment_starts[1:], len(states)]
-    for start, end in zip(segment_starts, segment_ends):
-        scale = selected_scale[start]
-        if scale >= 1.0:
-            multiplier = int(round(scale))
-            for interval in range(int(start), int(end)):
-                left_time = beat_times[interval]
-                right_time = beat_times[interval + 1]
-                candidates.append((left_time, evidence(left_time)))
-                for subdivision in range(1, multiplier):
-                    target = left_time + (right_time - left_time) * (
-                        subdivision / multiplier
-                    )
-                    candidates.append(snap_inserted_beat(target))
-            boundary = beat_times[int(end)]
-            candidates.append((boundary, evidence(boundary)))
-        else:
-            stride = int(round(1.0 / scale))
-            indices = np.arange(int(start), int(end) + 1)
-            best_phase = 0
-            best_score = -np.inf
-            for phase in range(stride):
-                selected = indices[(indices - int(start) - phase) % stride == 0]
-                if not len(selected):
-                    continue
-                frame_indices = np.asarray(
-                    [_frame_index(beat_times[index], frames) for index in selected]
-                )
-                score = float(
-                    np.mean(beat_probability[frame_indices])
-                    + 0.35 * np.mean(downbeat_probability[frame_indices])
-                )
-                if score > best_score:
-                    best_score = score
-                    best_phase = phase
-            selected = indices[
-                (indices - int(start) - best_phase) % stride == 0
-            ]
-            for index in selected:
-                time_seconds = beat_times[index]
-                candidates.append((time_seconds, evidence(time_seconds)))
-
-    # Preserve the outer extent, then collapse duplicate boundary candidates.
-    candidates.extend(
-        [
-            (beat_times[0], evidence(beat_times[0])),
-            (beat_times[-1], evidence(beat_times[-1])),
-        ]
-    )
-    candidates.sort(key=lambda item: item[0])
-    deduplicated: list[tuple[float, float]] = []
-    for candidate in candidates:
-        if deduplicated and candidate[0] - deduplicated[-1][0] < 0.08:
-            if candidate[1] > deduplicated[-1][1]:
-                deduplicated[-1] = candidate
-        else:
-            deduplicated.append(candidate)
-
-    # Enforce the canonical range on the final click grid, including transition
-    # boundaries. Resolve over-dense conflicts by evidence, then fill gaps.
-    minimum_period = 60.0 / NORMALIZED_BPM_MAX
-    maximum_period = 60.0 / NORMALIZED_BPM_MIN
-    constrained = deduplicated.copy()
-    while len(constrained) >= 2:
-        intervals = np.diff([item[0] for item in constrained])
-        conflicts = np.flatnonzero(intervals <= minimum_period + 1e-6)
-        if not len(conflicts):
-            break
-        left = int(conflicts[0])
-        right = left + 1
-        if left == 0:
-            remove = right
-        elif right == len(constrained) - 1:
-            remove = left
-        else:
-            remove = left if constrained[left][1] < constrained[right][1] else right
-        constrained.pop(remove)
-
-    regularized: list[tuple[float, float]] = []
-    for index, item in enumerate(constrained[:-1]):
-        regularized.append(item)
-        next_item = constrained[index + 1]
-        gap = next_item[0] - item[0]
-        subdivisions = max(1, int(math.ceil(gap / maximum_period)))
-        for subdivision in range(1, subdivisions):
-            time_seconds = item[0] + gap * subdivision / subdivisions
-            regularized.append((time_seconds, evidence(time_seconds)))
-    if constrained:
-        regularized.append(constrained[-1])
-    corrected_beats = np.asarray([item[0] for item in regularized], dtype=float)
-
-    source_downbeats = np.asarray(
-        fused_result.downbeat_times
-        if fused_result.downbeat_times is not None
-        else [],
-        dtype=float,
-    )
-    corrected_downbeats: list[float] = []
-    for time_seconds in corrected_beats:
-        index = _frame_index(time_seconds, frames)
-        has_source_downbeat = bool(
-            source_downbeats.size
-            and np.min(np.abs(source_downbeats - time_seconds)) <= 0.07
-        )
-        if has_source_downbeat or downbeat_probability[index] >= 0.5:
-            corrected_downbeats.append(time_seconds)
-
-    result = BeatResult(
-        method="beat-this-normalized",
-        beat_times=corrected_beats,
-        downbeat_times=np.asarray(corrected_downbeats, dtype=float),
-        note=(
-            "Offline [120, 240) BPM normalization over "
-            "0.25x/0.5x/1x/2x/4x metrical grids"
-        ),
-    )
-    decoding = GridDecoding(
-        interval_midpoints=midpoints,
-        interval_durations=np.diff(beat_times),
-        base_bpm=base_bpm,
-        selected_scale=selected_scale,
-        normalized_bpm=normalized_bpm,
-        confidence=confidence,
-        segment_id=segment_id,
-    )
-    return result, decoding
-
-
-def build_normalized_grid(
-    fused_result: BeatResult,
-    frames: FramePredictions,
-    active_ranges: list[tuple[float, float]],
-    snap_radius_seconds: float = 0.08,
-) -> tuple[BeatResult, GridDecoding]:
-    """Normalize each beat-active range independently without bridging gaps."""
-    normalized_results: list[BeatResult] = []
-    decodings: list[GridDecoding] = []
-    next_grid_segment = 0
-    beat_times = np.asarray(fused_result.beat_times, dtype=float)
-    downbeat_times = np.asarray(
-        fused_result.downbeat_times
-        if fused_result.downbeat_times is not None
-        else [],
-        dtype=float,
-    )
-
-    for range_index, (start, end) in enumerate(active_ranges):
-        is_last = range_index == len(active_ranges) - 1
-        beat_mask = (beat_times >= start) & (
-            (beat_times <= end) if is_last else (beat_times < end)
-        )
-        segment_beats = beat_times[beat_mask]
-        if len(segment_beats) < 2:
-            continue
-        downbeat_mask = (downbeat_times >= start) & (
-            (downbeat_times <= end) if is_last else (downbeat_times < end)
-        )
-        segment_result = BeatResult(
-            method=fused_result.method,
-            beat_times=segment_beats,
-            downbeat_times=downbeat_times[downbeat_mask],
-            note=fused_result.note,
-        )
-        normalized, decoding = _build_normalized_grid_segment(
-            segment_result,
-            frames,
-            snap_radius_seconds=snap_radius_seconds,
-        )
-        if len(decoding.segment_id):
-            decoding.segment_id = decoding.segment_id + next_grid_segment
-            next_grid_segment = int(decoding.segment_id[-1]) + 1
-        normalized_results.append(normalized)
-        decodings.append(decoding)
-
-    empty = np.asarray([], dtype=float)
-    if not normalized_results:
-        return (
-            BeatResult(
-                method="beat-this-normalized",
-                beat_times=empty,
-                downbeat_times=empty,
-                note="No beat-active segment contained enough beats",
-            ),
-            GridDecoding(empty, empty, empty, empty, empty, empty, empty),
-        )
-
-    corrected_beats = np.unique(
-        np.concatenate([result.beat_times for result in normalized_results])
-    )
-    corrected_downbeats = np.unique(
-        np.concatenate(
-            [
-                result.downbeat_times
-                for result in normalized_results
-                if result.downbeat_times is not None
-                and len(result.downbeat_times)
-            ]
-        )
-        if any(
-            result.downbeat_times is not None and len(result.downbeat_times)
-            for result in normalized_results
-        )
-        else empty
-    )
-    result = BeatResult(
-        method="beat-this-normalized",
-        beat_times=corrected_beats,
-        downbeat_times=corrected_downbeats,
-        note=(
-            "Offline [120, 240) BPM normalization over "
-            "0.25x/0.5x/1x/2x/4x metrical grids within beat-active segments"
-        ),
-    )
-    decoding = GridDecoding(
-        interval_midpoints=np.concatenate(
-            [item.interval_midpoints for item in decodings]
-        ),
-        interval_durations=np.concatenate(
-            [item.interval_durations for item in decodings]
-        ),
-        base_bpm=np.concatenate([item.base_bpm for item in decodings]),
-        selected_scale=np.concatenate(
-            [item.selected_scale for item in decodings]
-        ),
-        normalized_bpm=np.concatenate(
-            [item.normalized_bpm for item in decodings]
-        ),
-        confidence=np.concatenate([item.confidence for item in decodings]),
-        segment_id=np.concatenate([item.segment_id for item in decodings]),
-    )
-    return result, decoding
-
-
 def build_phase_aware_grid(
     repaired_result: BeatResult,
     frames: FramePredictions,
@@ -2246,6 +1968,190 @@ def refine_phase_grid_bidirectionally(
         ),
     )
     return result, refined, refined_transitions
+
+
+def phase_events_to_grid_decoding(events: list[PhaseGridEvent]) -> GridDecoding:
+    """Describe the final phase-aware grid without rebuilding a legacy grid."""
+    interval_midpoints: list[float] = []
+    interval_durations: list[float] = []
+    base_bpm: list[float] = []
+    selected_scale: list[float] = []
+    normalized_bpm: list[float] = []
+    confidence: list[float] = []
+    segment_ids: list[int] = []
+    for segment_id in sorted({item.activity_segment_id for item in events}):
+        segment = [
+            item for item in events if item.activity_segment_id == segment_id
+        ]
+        for left, right in zip(segment, segment[1:]):
+            duration = right.beat_time_seconds - left.beat_time_seconds
+            if duration <= 0:
+                continue
+            scale = float(right.selected_scale)
+            bpm = 60.0 / duration
+            interval_midpoints.append(
+                0.5 * (left.beat_time_seconds + right.beat_time_seconds)
+            )
+            interval_durations.append(duration)
+            normalized_bpm.append(bpm)
+            selected_scale.append(scale)
+            base_bpm.append(bpm / max(scale, 1e-9))
+            confidence.append(
+                float(
+                    np.clip(
+                        0.5 * (left.beat_probability + right.beat_probability),
+                        0.0,
+                        1.0,
+                    )
+                )
+            )
+            segment_ids.append(segment_id)
+    return GridDecoding(
+        interval_midpoints=np.asarray(interval_midpoints, dtype=float),
+        interval_durations=np.asarray(interval_durations, dtype=float),
+        base_bpm=np.asarray(base_bpm, dtype=float),
+        selected_scale=np.asarray(selected_scale, dtype=float),
+        normalized_bpm=np.asarray(normalized_bpm, dtype=float),
+        confidence=np.asarray(confidence, dtype=float),
+        segment_id=np.asarray(segment_ids, dtype=int),
+    )
+
+
+def validate_phase_grid(
+    result: BeatResult,
+    events: list[PhaseGridEvent],
+    active_ranges: list[tuple[float, float]],
+) -> list[str]:
+    """Return C4 continuity errors for one final phase-aware grid."""
+    errors: list[str] = []
+    times = np.asarray(result.beat_times, dtype=float)
+    if len(times) != len(events):
+        errors.append(f"result/event count mismatch: {len(times)} != {len(events)}")
+        return errors
+    if len(times) and not np.all(np.isfinite(times)):
+        errors.append("non-finite beat timestamp")
+    if len(times) > 1 and np.any(np.diff(times) <= 0):
+        errors.append("beat timestamps are not strictly increasing")
+    event_times = np.asarray(
+        [item.beat_time_seconds for item in events], dtype=float
+    )
+    if len(times) and not np.allclose(times, event_times, atol=1e-7, rtol=0.0):
+        errors.append("result timestamps differ from phase event timestamps")
+    if [item.grid_beat_index for item in events] != list(
+        range(1, len(events) + 1)
+    ):
+        errors.append("phase event indices are not consecutive")
+    if any(item.selected_scale not in GRID_SCALES for item in events):
+        errors.append("phase event uses a scale outside the five-state grid")
+
+    covered = np.zeros(len(times), dtype=bool)
+    minimum_period = 60.0 / NORMALIZED_BPM_MAX + 1e-4
+    maximum_period = 60.0 / NORMALIZED_BPM_MIN
+    for segment_id, (start, end) in enumerate(active_ranges):
+        is_last = segment_id == len(active_ranges) - 1
+        mask = (times >= start) & (
+            (times <= end) if is_last else (times < end)
+        )
+        covered |= mask
+        segment_times = times[mask]
+        segment_events = [
+            item for item in events if item.activity_segment_id == segment_id
+        ]
+        if len(segment_times) != len(segment_events):
+            errors.append(f"segment {segment_id} result/event membership mismatch")
+            continue
+        intervals = np.diff(segment_times)
+        if np.any(intervals < minimum_period - 1e-6) or np.any(
+            intervals > maximum_period + 1e-6
+        ):
+            errors.append(f"segment {segment_id} contains BPM outside [120, 240)")
+        if len(intervals) > 1:
+            ratios = intervals[1:] / intervals[:-1]
+            if np.any(ratios < 0.85 - 1e-6) or np.any(ratios > 1.15 + 1e-6):
+                errors.append(
+                    f"segment {segment_id} contains a discontinuous interval jump"
+                )
+    if len(times) and not np.all(covered):
+        errors.append("beat timestamp falls outside every beat-active segment")
+    return errors
+
+
+def finalize_phase_grid(
+    greedy_result: BeatResult,
+    greedy_events: list[PhaseGridEvent],
+    greedy_transitions: list[GridTransition],
+    frames: FramePredictions,
+    active_ranges: list[tuple[float, float]],
+    refinement: str,
+) -> tuple[
+    BeatResult,
+    list[PhaseGridEvent],
+    list[GridTransition],
+    bool,
+    bool,
+    str,
+]:
+    """Apply optional C3 refinement, validate it, and fall back to C2 safely."""
+    greedy_errors = validate_phase_grid(
+        greedy_result,
+        greedy_events,
+        active_ranges,
+    )
+    if greedy_errors:
+        raise ValueError(
+            "C4 greedy phase grid validation failed: " + "; ".join(greedy_errors)
+        )
+    if refinement != "bidirectional":
+        return (
+            BeatResult(
+                method="beat-this-phase-aware",
+                beat_times=greedy_result.beat_times.copy(),
+                downbeat_times=(
+                    greedy_result.downbeat_times.copy()
+                    if greedy_result.downbeat_times is not None
+                    else np.asarray([], dtype=float)
+                ),
+                note="P3-C4 validated greedy phase grid",
+            ),
+            [PhaseGridEvent(**asdict(item)) for item in greedy_events],
+            [GridTransition(**asdict(item)) for item in greedy_transitions],
+            False,
+            False,
+            "",
+        )
+    try:
+        result, events, transitions = refine_phase_grid_bidirectionally(
+            greedy_result,
+            greedy_events,
+            greedy_transitions,
+            frames,
+        )
+        errors = validate_phase_grid(result, events, active_ranges)
+        if errors:
+            raise ValueError("; ".join(errors))
+        return result, events, transitions, True, False, ""
+    except ValueError as exc:
+        reason = str(exc)
+        return (
+            BeatResult(
+                method="beat-this-phase-aware",
+                beat_times=greedy_result.beat_times.copy(),
+                downbeat_times=(
+                    greedy_result.downbeat_times.copy()
+                    if greedy_result.downbeat_times is not None
+                    else np.asarray([], dtype=float)
+                ),
+                note=(
+                    "P3-C4 fell back to the validated C2 phase grid after "
+                    f"refinement validation failed: {reason}"
+                ),
+            ),
+            [PhaseGridEvent(**asdict(item)) for item in greedy_events],
+            [GridTransition(**asdict(item)) for item in greedy_transitions],
+            False,
+            True,
+            reason,
+        )
 
 
 def modal_tempo(
@@ -3625,9 +3531,6 @@ def analyse_file(
         "repair_decisions": (
             file_output / f"{stem}__beat-this__repair-decisions.csv"
         ),
-        "legacy_normalized": (
-            file_output / f"{stem}__beat-this-legacy-normalized__beats.csv"
-        ),
         "phase_normalized": (
             file_output / f"{stem}__beat-this-phase-aware__beats.csv"
         ),
@@ -3643,6 +3546,14 @@ def analyse_file(
         "normalized": file_output / f"{stem}__beat-this-normalized__beats.csv",
         "grid": file_output / f"{stem}__beat-this__grid.csv",
     }
+    # P3-C4 retires legacy mechanical grid artifacts. They are generated data,
+    # not user input, and would otherwise look current after a cached rebuild.
+    for stale_path in (
+        file_output / f"{stem}__beat-this-legacy-normalized__beats.csv",
+        file_output / f"{stem}__beat-this-legacy-normalized__clicks.wav",
+        file_output / f"{stem}__beat-this__grid-comparison.png",
+    ):
+        stale_path.unlink(missing_ok=True)
     ensure_segments_csv(paths["segments"], duration)
     activity_segments = read_segments_csv(paths["segments"], duration)
     ranges = active_ranges(activity_segments, duration)
@@ -3758,28 +3669,10 @@ def analyse_file(
         repaired_result.note,
     )
     repair_decisions = read_repair_decisions_csv(paths["repair_decisions"])
-    grid_input = (
-        repaired_result if args.repair_mode == "conservative" else fused_result
-    )
-    legacy_result, grid_decoding = build_normalized_grid(
-        grid_input,
-        frames,
-        ranges,
-    )
-    legacy_result.method = "beat-this-legacy-normalized"
-    legacy_midpoints, legacy_raw, legacy_smooth = local_tempo(
-        legacy_result.beat_times
-    )
-    write_beats_csv(
-        paths["legacy_normalized"],
-        legacy_result,
-        legacy_midpoints,
-        legacy_raw,
-        legacy_smooth,
-        sr,
-        ranges,
-    )
-    write_grid_decisions_csv(paths["grid"], grid_decoding)
+    # P3-C4 makes phase-aware decoding the sole grid generator. P3-A/P3-B
+    # remain useful diagnostics and audition tools, but their mechanical
+    # insert/remove proposal is never fed into the official grid.
+    grid_input = fused_result
 
     greedy_phase_result, greedy_phase_events, greedy_grid_transitions = (
         build_phase_aware_grid(
@@ -3806,28 +3699,22 @@ def analyse_file(
         "beat-this-phase-greedy",
         greedy_phase_result.note,
     )
-    if args.phase_refinement == "bidirectional":
-        phase_result, phase_events, grid_transitions = (
-            refine_phase_grid_bidirectionally(
-                greedy_phase_result,
-                greedy_phase_events,
-                greedy_grid_transitions,
-                frames,
-            )
-        )
-    else:
-        phase_result = BeatResult(
-            method="beat-this-phase-aware",
-            beat_times=greedy_phase_result.beat_times.copy(),
-            downbeat_times=(
-                greedy_phase_result.downbeat_times.copy()
-                if greedy_phase_result.downbeat_times is not None
-                else np.asarray([], dtype=float)
-            ),
-            note="P3-C greedy forward phase grid without bidirectional refinement",
-        )
-        phase_events = greedy_phase_events
-        grid_transitions = greedy_grid_transitions
+    (
+        phase_result,
+        phase_events,
+        grid_transitions,
+        refinement_applied,
+        fallback_used,
+        fallback_reason,
+    ) = finalize_phase_grid(
+        greedy_phase_result,
+        greedy_phase_events,
+        greedy_grid_transitions,
+        frames,
+        ranges,
+        args.phase_refinement,
+    )
+    grid_decoding = phase_events_to_grid_decoding(phase_events)
     phase_midpoints, phase_raw, phase_smooth = local_tempo(
         phase_result.beat_times
     )
@@ -3842,13 +3729,9 @@ def analyse_file(
     )
     write_phase_grid_events_csv(paths["phase_events"], phase_events)
     write_grid_transitions_csv(paths["grid_transitions"], grid_transitions)
+    write_grid_decisions_csv(paths["grid"], grid_decoding)
 
     # Reload derived CSVs too, so plots/reports cannot diverge from saved data.
-    legacy_result = read_beats_csv(
-        paths["legacy_normalized"],
-        "beat-this-legacy-normalized",
-        legacy_result.note,
-    )
     phase_result = read_beats_csv(
         paths["phase_normalized"],
         "beat-this-phase-aware",
@@ -3857,20 +3740,27 @@ def analyse_file(
     phase_events = read_phase_grid_events_csv(paths["phase_events"])
     grid_transitions = read_grid_transitions_csv(paths["grid_transitions"])
     grid_decoding = read_grid_decisions_csv(paths["grid"])
-    selected_grid = (
-        phase_result if args.grid_mode == "phase-aware" else legacy_result
+    persisted_validation_errors = validate_phase_grid(
+        phase_result,
+        phase_events,
+        ranges,
     )
+    if persisted_validation_errors:
+        raise ValueError(
+            "C4 persisted phase grid validation failed: "
+            + "; ".join(persisted_validation_errors)
+        )
     normalized_result = BeatResult(
         method="beat-this-normalized",
-        beat_times=selected_grid.beat_times.copy(),
+        beat_times=phase_result.beat_times.copy(),
         downbeat_times=(
-            selected_grid.downbeat_times.copy()
-            if selected_grid.downbeat_times is not None
+            phase_result.downbeat_times.copy()
+            if phase_result.downbeat_times is not None
             else np.asarray([], dtype=float)
         ),
         note=(
-            f"Official normalized output from P3-C {args.grid_mode} mode; "
-            f"source={selected_grid.method}"
+            "Official normalized output from the validated P3-C4 phase-aware "
+            f"grid; source={phase_result.method}"
         ),
     )
     normalized_midpoints, normalized_raw, normalized_smooth = local_tempo(
@@ -3900,15 +3790,6 @@ def analyse_file(
         write_click_track(
             file_output / f"{stem}__{result.method}__clicks.wav", y, sr, result
         )
-    preview_result = (
-        phase_result if args.grid_mode != "phase-aware" else legacy_result
-    )
-    write_click_track(
-        file_output / f"{stem}__{preview_result.method}__clicks.wav",
-        y,
-        sr,
-        preview_result,
-    )
     if args.phase_refinement == "bidirectional":
         write_click_track(
             file_output / f"{stem}__{greedy_phase_result.method}__clicks.wav",
@@ -3947,15 +3828,6 @@ def analyse_file(
         fused_result,
         repaired_result,
         repair_decisions,
-        duration,
-        blocked_ranges,
-    )
-    write_phase_grid_comparison_plot(
-        file_output / f"{stem}__beat-this__grid-comparison.png",
-        audio_path.name,
-        legacy_result,
-        phase_result,
-        grid_transitions,
         duration,
         blocked_ranges,
     )
@@ -4093,18 +3965,12 @@ def analyse_file(
             "mode": args.repair_mode,
             "repair_decisions_csv": paths["repair_decisions"].name,
             "repaired_beats_csv": paths["repaired"].name,
-            "normalization_input": (
-                "beat-this-repaired"
-                if args.repair_mode == "conservative"
-                else "beat-this-fused"
-            ),
+            "normalization_input": "beat-this-fused",
             "accepted_repairs": sum(
                 item.status in {"preview_applied", "applied"}
                 for item in repair_decisions
             ),
-            "applied_to_normalization": sum(
-                item.status == "applied" for item in repair_decisions
-            ),
+            "applied_to_normalization": 0,
             "inserted_beats": sum(
                 item.repair_action == "insert" for item in repair_records
             ),
@@ -4120,16 +3986,15 @@ def analyse_file(
                 item.status == "rejected" for item in repair_decisions
             ),
             "note": (
-                "Preview writes and auditions the conservative repair proposal "
-                "without feeding it to normalization. Conservative mode uses "
-                "the saved repaired CSV as grid input."
+                "P3-C4 keeps the conservative repair proposal as an audition "
+                "and diagnostic artifact; it never feeds mechanical insert/remove "
+                "decisions into the official phase-aware grid."
             ),
         },
         "p3c_phase_grid": {
-            "mode": args.grid_mode,
+            "mode": "phase-aware",
             "phase_refinement": args.phase_refinement,
-            "official_normalization_source": selected_grid.method,
-            "legacy_beats_csv": paths["legacy_normalized"].name,
+            "official_normalization_source": phase_result.method,
             "greedy_phase_beats_csv": paths["phase_greedy"].name,
             "phase_aware_beats_csv": paths["phase_normalized"].name,
             "phase_grid_csv": paths["phase_events"].name,
@@ -4158,6 +4023,16 @@ def analyse_file(
             "event_count_change_from_greedy": (
                 len(phase_result.beat_times) - len(greedy_phase_result.beat_times)
             ),
+            "c4_validation": {
+                "status": "passed",
+                "refinement_requested": args.phase_refinement,
+                "refinement_applied": refinement_applied,
+                "fallback_used": fallback_used,
+                "fallback_source": (
+                    "beat-this-phase-greedy" if fallback_used else None
+                ),
+                "fallback_reason": fallback_reason or None,
+            },
             "refined_beats": int(np.sum(refinement_shifts > 1e-6)),
             "maximum_refinement_seconds": (
                 round(float(np.max(refinement_shifts)), 6)
@@ -4174,9 +4049,9 @@ def analyse_file(
                 )
             ),
             "note": (
-                "Preview keeps legacy as the official normalized output while "
-                "writing a phase-continuous alternative. Phase-aware mode "
-                "promotes the saved alternative to official normalized output."
+                "P3-C4 uses phase-aware decoding as the only grid generator. "
+                "A failed refined grid falls back to the validated greedy "
+                "phase path rather than legacy normalization."
             ),
         },
         "grid_normalization": {
@@ -4200,7 +4075,7 @@ def analyse_file(
             "All plots and reports are regenerated from saved CSV data. "
             "NO_BEAT ranges are excluded from clicks, tempo statistics, and grid decoding. "
             f"P3-B repair mode is {args.repair_mode}. "
-            f"P3-C grid mode is {args.grid_mode}. "
+            "P3-C4 phase-aware grid mode is the sole normalization path. "
             "Highlighted tempo-change regions are candidates, not ground truth. "
             "Exact 2x/0.5x tempo changes are musically ambiguous; raw BPM remains in each beat CSV."
         ),
@@ -4259,22 +4134,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repair-mode",
-        choices=("off", "preview", "conservative"),
+        choices=("off", "preview"),
         default="preview",
         help=(
             "P3-B beat repair mode: off keeps fused beats; preview writes and "
-            "auditions proposals without changing normalization (default); "
-            "conservative feeds accepted repaired beats into normalization"
+            "auditions proposals without changing normalization (default)"
         ),
     )
     parser.add_argument(
         "--grid-mode",
-        choices=("legacy", "preview", "phase-aware"),
-        default="preview",
+        choices=("phase-aware",),
+        default="phase-aware",
         help=(
-            "P3-C grid mode: legacy keeps the old grid; preview writes a "
-            "phase-aware alternative while keeping legacy official (default); "
-            "phase-aware promotes the continuous-phase grid to normalized output"
+            "P3-C4 grid mode: phase-aware is the sole normalized grid path"
         ),
     )
     parser.add_argument(

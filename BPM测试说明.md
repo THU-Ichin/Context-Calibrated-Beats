@@ -3,8 +3,10 @@
 脚本 `compare_bpm.py` 使用 `Beat This!` 预训练 Transformer 输出 beat 和 downbeat，
 并生成局部 BPM、疑似变速区间和试听用 click-track。脚本同时保留官方分块基线，
 并使用重叠窗口融合逐帧 logits，以减少约 30 秒分块处的硬接缝。
-融合结果随后进入五层网格解码器，在 `0.25x / 0.5x / 1x / 2x / 4x`
-候选中选择路径，并将最终 click 网格归一化到 `[120, 240)` BPM。
+融合结果随后进入唯一的 phase-aware 五层网格解码器，在
+`0.25x / 0.5x / 1x / 2x / 4x` 候选中选择连续相位路径，并将最终
+click 网格归一化到 `[120, 240)` BPM。旧版先机械删拍、填拍再做末端
+约束的网格生成器已经移除。
 推理产生的基础数据会先保存到 CSV，再从 CSV 重载并生成归一化结果、统计、
 click-track 和图片，避免落盘数据与绘图数据来自不同处理阶段。
 
@@ -65,7 +67,7 @@ python compare_bpm.py "audio\Reply.mp3" -o bpm_results --beat-this-hop-seconds 5
 python compare_bpm.py "audio\Reply.mp3" -o bpm_results --reuse-inference
 ```
 
-该模式不会重新运行模型，但会重新生成 normalized CSV、三套 click、图片、
+该模式不会重新运行模型，但会重新生成 normalized CSV、click、图片、
 报告和汇总。音频路径、输出目录和歌曲文件名必须与首次运行一致。
 
 ## 标注 NO_BEAT
@@ -98,6 +100,8 @@ segment_id,start_seconds,end_seconds,no_beat,source,note
 - `__beat-this-raw__beats.csv`：官方 30 秒分块、`keep_first` 拼接后的拍点；
 - `__beat-this-fused__beats.csv`：重叠窗口 Hann 加权融合后的拍点；
 - `__beat-this-normalized__beats.csv`：五层网格解码和最终间距约束后的拍点；
+- `__beat-this-phase-greedy__beats.csv`：C2 贪心相位路径，用作细化失败时的安全回退；
+- `__beat-this-phase-aware__beats.csv`：经过 C3 双向细化和 C4 连续性验证的相位路径；
 - 对应的 `__clicks.wav`：raw/fused/normalized 三套试听文件，高音点击代表 downbeat；
 - `__beat-this__frames.csv`：50 FPS 的 raw/fused beat、downbeat logits 和概率；
 - `__beat-this__grid.csv`：每个区间的基础 BPM、选中倍率、归一化 BPM 和置信度；
@@ -116,7 +120,11 @@ segment_id,start_seconds,end_seconds,no_beat,source,note
 
 判断好坏时，优先试听 normalized，并与 raw/fused 两套 `__clicks.wav` 做 A/B：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
 
-网格解码器利用离线动态规划选择倍率。高倍率网格会在理论位置附近搜索 fused logit 峰补拍，低倍率网格会比较不同相位后删拍；最后解决小于 0.25 秒的冲突并填补大于 0.5 秒的缺口，使最终相邻拍点满足 `[120, 240)`。
+phase-aware 解码器逐拍维持相位连续性，并只在五个允许的倍率之间切换。
+C3 双向细化不会再经过旧版末端删拍/填拍规则。C4 在落盘前后检查时间顺序、
+活动区段归属、倍率合法性、`[120, 240)` 范围和相邻周期连续性；如果 C3
+细化没有通过校验，会回退到已经验证的 C2 贪心相位路径，而不会回退到旧版网格。
+P3-B 的修复结果仍会保存供诊断和试听，但不会作为正式网格的输入。
 
 ## 关于“瞬时 BPM”
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -37,9 +38,10 @@ class CsvPipelineTest(unittest.TestCase):
             bpm.ActivitySegment(0, 3.0, 6.0, True, "user", "test gap")
         ]
         ranges = bpm.active_ranges(segments, 10.0)
-        normalized, decoding = bpm.build_normalized_grid(
+        normalized, events, _ = bpm.build_phase_aware_grid(
             self.result, self.frames, ranges
         )
+        decoding = bpm.phase_events_to_grid_decoding(events)
 
         self.assertEqual(ranges, [(0.0, 3.0), (6.0, 10.0)])
         self.assertFalse(
@@ -65,9 +67,10 @@ class CsvPipelineTest(unittest.TestCase):
 
     def test_csv_round_trip_preserves_inference_and_beats(self) -> None:
         ranges = [(0.0, 10.0)]
-        normalized, decoding = bpm.build_normalized_grid(
+        normalized, events, _ = bpm.build_phase_aware_grid(
             self.result, self.frames, ranges
         )
+        decoding = bpm.phase_events_to_grid_decoding(events)
         metadata = bpm.InferenceMetadata(
             fps=self.fps,
             window_seconds=30.0,
@@ -336,6 +339,42 @@ class CsvPipelineTest(unittest.TestCase):
         intervals = np.diff(result.beat_times)
         self.assertTrue(np.all(intervals > 60.0 / bpm.NORMALIZED_BPM_MAX))
         self.assertTrue(np.all(intervals <= 60.0 / bpm.NORMALIZED_BPM_MIN))
+
+    def test_p3c4_invalid_refinement_falls_back_to_greedy_phase_grid(self) -> None:
+        greedy, events, transitions = bpm.build_phase_aware_grid(
+            self.result,
+            self.frames,
+            [(0.0, 10.0)],
+        )
+        invalid_times = greedy.beat_times.copy()
+        invalid_times[2] = invalid_times[1] + 0.10
+        invalid = bpm.BeatResult(
+            "beat-this-phase-aware",
+            invalid_times,
+            downbeat_times=greedy.downbeat_times,
+        )
+
+        with patch.object(
+            bpm,
+            "refine_phase_grid_bidirectionally",
+            return_value=(invalid, events, transitions),
+        ):
+            result, final_events, _, applied, fallback, reason = (
+                bpm.finalize_phase_grid(
+                    greedy,
+                    events,
+                    transitions,
+                    self.frames,
+                    [(0.0, 10.0)],
+                    "bidirectional",
+                )
+            )
+
+        np.testing.assert_array_equal(result.beat_times, greedy.beat_times)
+        self.assertEqual(len(final_events), len(events))
+        self.assertFalse(applied)
+        self.assertTrue(fallback)
+        self.assertIn("result timestamps differ", reason)
 
     def test_p3c_future_window_backtracks_and_restores_missing_beat(self) -> None:
         period = 0.34
