@@ -13,8 +13,8 @@ those candidates into a traceable repaired-beat proposal. Preview mode keeps
 the proposal out of grid normalisation; conservative mode uses its saved CSV.
 P3-C adds a phase-continuous five-scale grid beside the legacy decoder and can
 promote that saved preview to the official normalized output. Its optional
-bidirectional pass recovers long tempo-grid dropouts, jointly refines bridge
-beats, and can use a stable future window to backtrack across a mis-phased region.
+bidirectional pass jointly refines bridge beats and can use a stable future
+window to backtrack across an internally mis-phased region.
 
 The raw local BPM is exactly 60 / (time between adjacent detected beats).
 The smoothed value is intended for visualisation and change detection only.
@@ -1749,269 +1749,6 @@ def refine_phase_grid_bidirectionally(
             previous_interval = interval
         return total
 
-    # Long ambiguous passages need a different treatment from a short bridge.
-    # Beat This may keep only every second/fourth musical beat, or may fire on
-    # dense transients, while the normalized greedy path remains technically in
-    # [120, 240) BPM. Confirm equal-tempo stable windows on both sides, accept
-    # regularly spaced subharmonic acoustic evidence in the future window, and
-    # rebuild the whole dropout from that future phase before local refinement.
-    long_window_seconds = 4.0
-    minimum_long_dropout_seconds = 8.0
-    maximum_long_dropout_seconds = 30.0
-
-    def is_transition_event(item: PhaseGridEvent) -> bool:
-        return (
-            item.event_source in {"phase_bridge", "bidirectional_refined"}
-            or item.transition_type
-            in {"phase_bridge", "scale_switch", "bidirectional_bridge"}
-        )
-
-    def fit_long_stable_window(
-        segment: list[PhaseGridEvent], start: int
-    ) -> tuple[int, float, float, float, int, float] | None:
-        if start >= len(segment) or is_transition_event(segment[start]):
-            return None
-        stop = start + 1
-        while stop < len(segment):
-            if is_transition_event(segment[stop]):
-                return None
-            span = segment[stop].beat_time_seconds - segment[start].beat_time_seconds
-            stop += 1
-            if span >= long_window_seconds:
-                break
-        if stop - start < 9:
-            return None
-        window = segment[start:stop]
-        times = np.asarray([item.beat_time_seconds for item in window], dtype=float)
-        if times[-1] - times[0] < long_window_seconds:
-            return None
-        positions = np.arange(len(times), dtype=float)
-        period, phase_at_start = np.polyfit(positions, times, 1)
-        period = float(period)
-        phase_at_start = float(phase_at_start)
-        if not minimum_period <= period <= maximum_period:
-            return None
-        intervals = np.diff(times)
-        residuals = times - (phase_at_start + positions * period)
-        stability = _robust_stability(intervals)
-        if (
-            stability < 0.75
-            or float(np.max(np.abs(residuals))) > max(0.035, 0.12 * period)
-            or float(np.max(np.abs(intervals - period) / period)) > 0.16
-            or len({item.selected_scale for item in window}) != 1
-        ):
-            return None
-
-        # A model locked at half/quarter rate supplies strong evidence on every
-        # second/fourth normalized grid point. Score those regular subsequences
-        # instead of requiring most individual grid events to be acoustic peaks.
-        best_stride = 1
-        best_support = 0.0
-        for stride in (1, 2, 4):
-            for offset in range(stride):
-                selected = window[offset::stride]
-                if len(selected) < 3:
-                    continue
-                support = float(
-                    np.mean(
-                        [
-                            item.event_source == "acoustic_peak"
-                            and (
-                                item.beat_probability >= 0.45
-                                or item.downbeat_probability >= 0.45
-                            )
-                            for item in selected
-                        ]
-                    )
-                )
-                if support > best_support:
-                    best_support = support
-                    best_stride = stride
-        if best_support < 0.65:
-            return None
-        return (
-            stop,
-            period,
-            phase_at_start,
-            stability,
-            best_stride,
-            best_support,
-        )
-
-    def phase_distance(time_seconds: float, phase: float, period: float) -> float:
-        step = round((time_seconds - phase) / period)
-        return abs(time_seconds - (phase + step * period))
-
-    long_rebuilt: list[PhaseGridEvent] = []
-    for segment_id in sorted({item.activity_segment_id for item in refined}):
-        segment = [
-            item for item in refined if item.activity_segment_id == segment_id
-        ]
-        stable_windows = [
-            (start, fitted)
-            for start in range(len(segment))
-            if (fitted := fit_long_stable_window(segment, start)) is not None
-        ]
-        for future_start, future_fit in stable_windows:
-            (
-                _,
-                future_period,
-                future_phase,
-                future_stability,
-                evidence_stride,
-                evidence_support,
-            ) = future_fit
-            future_time = segment[future_start].beat_time_seconds
-            past_options = [
-                (past_start, past_fit)
-                for past_start, past_fit in stable_windows
-                if past_fit[0] <= future_start
-                and minimum_long_dropout_seconds
-                <= future_time - segment[past_fit[0] - 1].beat_time_seconds
-                <= maximum_long_dropout_seconds
-                and abs(past_fit[1] - future_period) / future_period <= 0.04
-            ]
-            if not past_options:
-                continue
-            # The closest equal-tempo stable window gives the narrowest safe
-            # repair. A genuinely stable middle section therefore prevents a
-            # needlessly broad rewrite.
-            _, past_fit = max(
-                past_options,
-                key=lambda item: segment[item[1][0] - 1].beat_time_seconds,
-            )
-            past_stop, past_period, _, past_stability, _, _ = past_fit
-            middle = segment[past_stop:future_start]
-            if len(middle) < 3:
-                continue
-            middle_start_time = segment[past_stop - 1].beat_time_seconds
-            middle_duration = future_time - middle_start_time
-            if not minimum_long_dropout_seconds <= middle_duration <= maximum_long_dropout_seconds:
-                continue
-            transition_count = sum(is_transition_event(item) for item in middle)
-            scale_count = len({item.selected_scale for item in middle})
-            expected_intervals = int(round(middle_duration / future_period))
-            observed_intervals = len(middle) + 1
-            count_error = abs(expected_intervals - observed_intervals)
-            if transition_count < 3 or scale_count < 2 or count_error < 2:
-                continue
-
-            # Find the earliest pair of strong events inside the dropout that
-            # agrees with the future lattice. This permits a real phase reset at
-            # the passage entrance without rewriting the preceding stable music.
-            boundary_limit = max(0.025, 0.12 * future_period)
-            strong_positions = [
-                index
-                for index in range(past_stop, future_start)
-                if phase_distance(
-                    segment[index].beat_time_seconds,
-                    future_phase,
-                    future_period,
-                )
-                <= boundary_limit
-                and (
-                    segment[index].beat_probability >= 0.50
-                    or segment[index].downbeat_probability >= 0.50
-                )
-            ]
-            left_anchor: int | None = None
-            for first, second in zip(strong_positions, strong_positions[1:]):
-                span = (
-                    segment[second].beat_time_seconds
-                    - segment[first].beat_time_seconds
-                )
-                steps = int(round(span / future_period))
-                if 1 <= steps <= 4 and abs(span - steps * future_period) <= boundary_limit:
-                    left_anchor = first
-                    break
-            if left_anchor is None:
-                continue
-
-            left_time = segment[left_anchor].beat_time_seconds
-            right_time = segment[future_start].beat_time_seconds
-            interval_count = int(round((right_time - left_time) / future_period))
-            if interval_count < 2:
-                continue
-            corrected_period = (right_time - left_time) / interval_count
-            if (
-                not minimum_period <= corrected_period <= maximum_period
-                or abs(corrected_period - future_period) / future_period > 0.04
-            ):
-                continue
-            old_middle = segment[left_anchor + 1 : future_start]
-            expected_middle_count = interval_count - 1
-            if abs(expected_middle_count - len(old_middle)) < 2:
-                continue
-
-            projected_times = left_time + corrected_period * np.arange(
-                1, interval_count, dtype=float
-            )
-            replacement: list[PhaseGridEvent] = []
-            templates = old_middle or [segment[left_anchor], segment[future_start]]
-            for projected_time in projected_times:
-                template = min(
-                    templates,
-                    key=lambda item: abs(
-                        item.beat_time_seconds - float(projected_time)
-                    ),
-                )
-                beat_prob, downbeat_prob = probabilities(float(projected_time))
-                replacement.append(
-                    PhaseGridEvent(
-                        grid_beat_index=template.grid_beat_index,
-                        activity_segment_id=segment_id,
-                        beat_time_seconds=float(projected_time),
-                        selected_scale=segment[future_start].selected_scale,
-                        target_period_seconds=float(corrected_period),
-                        predicted_time_seconds=float(projected_time),
-                        phase_residual_seconds=0.0,
-                        beat_probability=beat_prob,
-                        downbeat_probability=downbeat_prob,
-                        event_source="future_long_backtrack",
-                        transition_type="future_long_backtrack",
-                        path_cost=template.path_cost,
-                    )
-                )
-            nearest_shifts = [
-                min(
-                    abs(item.beat_time_seconds - float(projected_time))
-                    for projected_time in projected_times
-                )
-                for item in old_middle
-            ]
-            refined_transitions.append(
-                GridTransition(
-                    transition_id=len(refined_transitions) + 1,
-                    activity_segment_id=segment_id,
-                    start_seconds=left_time,
-                    end_seconds=right_time,
-                    previous_scale=segment[left_anchor].selected_scale,
-                    next_scale=segment[future_start].selected_scale,
-                    previous_period_seconds=past_period,
-                    next_period_seconds=float(corrected_period),
-                    phase_adjustment_seconds=(
-                        float(max(nearest_shifts)) if nearest_shifts else 0.0
-                    ),
-                    transition_type="future_long_backtrack",
-                    diagnostic_note=(
-                        "Long dropout rebuilt from future phase; "
-                        f"past_stability={past_stability:.3f}, "
-                        f"future_stability={future_stability:.3f}, "
-                        f"evidence_stride={evidence_stride}, "
-                        f"evidence_support={evidence_support:.3f}, "
-                        f"events={len(old_middle)}->{len(replacement)}"
-                    ),
-                )
-            )
-            segment = (
-                segment[: left_anchor + 1]
-                + replacement
-                + segment[future_start:]
-            )
-            break
-        long_rebuilt.extend(segment)
-    refined = long_rebuilt
-
     windows: list[tuple[int, int]] = []
     for segment_id in sorted({item.activity_segment_id for item in refined}):
         segment_indices = [
@@ -2505,8 +2242,7 @@ def refine_phase_grid_bidirectionally(
         beat_times=output_times,
         downbeat_times=output_downbeats,
         note=(
-            "P3-C bidirectional phase grid with long-dropout recovery and "
-            "future-confirmed backtracking"
+            "P3-C bidirectional phase grid with future-confirmed backtracking"
         ),
     )
     return result, refined, refined_transitions
@@ -4415,16 +4151,8 @@ def analyse_file(
                 item.transition_type == "future_confirmed_backtrack"
                 for item in grid_transitions
             ),
-            "future_long_backtrack_windows": sum(
-                item.transition_type == "future_long_backtrack"
-                for item in grid_transitions
-            ),
             "future_backtracked_beats": sum(
                 item.event_source == "future_confirmed_backtrack"
-                for item in phase_events
-            ),
-            "future_long_backtracked_beats": sum(
-                item.event_source == "future_long_backtrack"
                 for item in phase_events
             ),
             "event_count_change_from_greedy": (
@@ -4555,9 +4283,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="bidirectional",
         help=(
             "P3-C3 phase refinement: greedy keeps the C2 forward tracker; "
-            "bidirectional recovers long grid dropouts, jointly optimizes "
-            "bridge beats, and backtracks from independently stable future "
-            "phase (default)"
+            "bidirectional jointly optimizes bridge beats and backtracks from "
+            "independently stable future phase (default)"
         ),
     )
     return parser
