@@ -405,6 +405,85 @@ class CsvPipelineTest(unittest.TestCase):
             any(item.event_source == "future_confirmed_backtrack" for item in refined)
         )
 
+    def test_p3c_long_backtrack_accepts_half_rate_future_evidence(self) -> None:
+        period = 0.30
+        correct_grid = np.arange(0.0, 20.11, period)
+        past = correct_grid[correct_grid <= 5.10 + 1e-9]
+        entrance = np.asarray([5.40, 5.70])
+        wrong_middle = np.arange(6.10, 14.51, 0.40)
+        future = correct_grid[correct_grid >= 15.00 - 1e-9]
+        times = np.concatenate((past, entrance, wrong_middle, future))
+
+        logits = np.full(round(20.5 * self.fps), -6.0)
+        for time_seconds in correct_grid:
+            logits[round(time_seconds * self.fps)] = 6.0
+        frames = bpm.FramePredictions(
+            fps=self.fps,
+            raw_beat_logits=logits.copy(),
+            raw_downbeat_logits=np.full_like(logits, -6.0),
+            fused_beat_logits=logits.copy(),
+            fused_downbeat_logits=np.full_like(logits, -6.0),
+            window_seconds=30.0,
+            hop_seconds=10.0,
+            overlap_windows=1,
+        )
+        events = []
+        middle_start = len(past) + len(entrance)
+        future_start = len(past) + len(entrance) + len(wrong_middle)
+        for index, time_seconds in enumerate(times):
+            is_middle = middle_start <= index < future_start
+            is_transition = len(past) <= index < middle_start + 1
+            in_supported_window = index < len(past) or index >= future_start
+            supported_peak = in_supported_window and index % 2 == 0
+            events.append(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=index + 1,
+                    activity_segment_id=0,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=(0.5 if is_middle and index % 2 else 1.0),
+                    target_period_seconds=period,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=1.0 if supported_peak or index in {
+                        len(past),
+                        len(past) + 1,
+                    } else 0.01,
+                    downbeat_probability=0.0,
+                    event_source=(
+                        "phase_bridge"
+                        if is_transition
+                        else "acoustic_peak"
+                        if supported_peak
+                        else "theoretical_grid"
+                    ),
+                    transition_type=(
+                        "phase_bridge" if is_transition else "stable"
+                    ),
+                    path_cost=float(index),
+                )
+            )
+
+        result, refined, transitions = bpm.refine_phase_grid_bidirectionally(
+            bpm.BeatResult("beat-this-phase-aware", times),
+            events,
+            [],
+            frames,
+        )
+        self.assertGreater(len(result.beat_times), len(times))
+        rebuilt = result.beat_times[
+            (result.beat_times >= 5.40) & (result.beat_times <= 15.00)
+        ]
+        np.testing.assert_allclose(np.diff(rebuilt), period, atol=1e-6)
+        self.assertTrue(
+            any(
+                item.transition_type == "future_long_backtrack"
+                for item in transitions
+            )
+        )
+        self.assertTrue(
+            any(item.event_source == "future_long_backtrack" for item in refined)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
