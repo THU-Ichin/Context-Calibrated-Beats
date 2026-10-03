@@ -3,14 +3,19 @@
 .venv*/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.codex-test-tmp/
+build/
+dist/
+*.egg-info/
 
 # IDE settings
 .idea/
 .vscode/
 
-# Test audio and model binaries
-audio/*
-!audio/.gitkeep
+# Local audio and model binaries
+audio/
+audio2/
 *.mp3
 *.wav
 *.flac
@@ -21,6 +26,8 @@ audio/*
 
 # Generated analysis results
 bpm_results*/
+results/
+.ccb-cache/
 result_plp*/
 click_test_loud/
 reply_click_loud/
@@ -32,3 +39,6 @@ jp_font/
 *.bak-*
 .DS_Store
 Thumbs.db
+
+# Private local project handoff notes
+CODEX_HANDOFF_CCB.md

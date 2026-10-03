@@ -1,175 +1,271 @@
-# Beat This! BPM/节拍分析
+# CCB 使用说明
 
-脚本 `compare_bpm.py` 使用 `Beat This!` 预训练 Transformer 输出 beat 和 downbeat，
-并生成局部 BPM、疑似变速区间和试听用 click-track。脚本同时保留官方分块基线，
-并使用重叠窗口融合逐帧 logits，以减少约 30 秒分块处的硬接缝。
-融合结果随后进入唯一的 phase-aware 五层网格解码器，在
-`0.25x / 0.5x / 1x / 2x / 4x` 候选中选择连续相位路径，并将最终
-click 网格归一化到 `[120, 240)` BPM。旧版先机械删拍、填拍再做末端
-约束的网格生成器已经移除。
-推理产生的基础数据会先保存到 CSV，再从 CSV 重载并生成归一化结果、统计、
-click-track 和图片，避免落盘数据与绘图数据来自不同处理阶段。
+CCB（Context Calibrated Beats）是一个离线音乐节拍网格工具。它使用 Beat This! 生成拍点和 downbeat，再将速度归一化到 `[120, 240)` BPM。
 
-`librosa` 只用于音频读取、时长计算、click 合成和归一化，不再参与节拍检测。
+软件只保留一套正式结果，不生成 raw、fused、repaired 等历史阶段文件。
 
-## 安装
+## 环境
 
-建议使用 Python 3.10～3.12，并建立独立虚拟环境：
+支持 Python 3.10–3.12，建议使用 Python 3.12：
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements-bpm.txt
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-`Beat This!` 第一次运行时可能需要联网下载预训练权重。脚本不再提供其他节拍检测器作为回退；若模型无法初始化或推理失败，会返回错误并停止。
+## 基本用法
 
-## 运行
-
-分析一首歌：
+处理一首歌：
 
 ```powershell
-python compare_bpm.py "audio\Reply.mp3" -o bpm_results
+python CCB.py "D:\Music\song.mp3"
 ```
 
-一次分析多首：
+同时处理多首歌：
 
 ```powershell
-python compare_bpm.py "D:\Music\song1.mp3" "D:\Music\song2.wav" -o bpm_results
+python CCB.py "D:\Music\song1.mp3" "D:\Music\song2.wav"
 ```
 
-有 NVIDIA GPU 时可以尝试：
+指定输出目录：
 
 ```powershell
-python compare_bpm.py "D:\Music\song.mp3" -o bpm_results --beat-this-device cuda
+python CCB.py "D:\Music\song.mp3" -o results
 ```
 
-可以限制主导 BPM 统计和变速分析所采用的速度范围：
+使用 GPU：
 
 ```powershell
-python compare_bpm.py "D:\Music\song.mp3" -o bpm_results --min-bpm 70 --max-bpm 190
+python CCB.py "D:\Music\song.mp3" --beat-this-device cuda
 ```
 
-该范围不限制 Beat This! 模型本身的推理。
-
-重叠推理固定使用 30 秒窗口，默认每 10 秒启动一个窗口。可以调整 hop；数值越小，
-同一时刻参与融合的窗口越多，但推理耗时也越长：
+不生成 click 音轨：
 
 ```powershell
-python compare_bpm.py "audio\Reply.mp3" -o bpm_results --beat-this-hop-seconds 5
+python CCB.py "D:\Music\song.mp3" --no-click
 ```
 
-首次运行后，每首歌目录会生成可编辑的 `__segments.csv`。修改其中的
-`NO_BEAT` 区段后，可以复用已经保存的 Beat This! 推理结果快速重建派生文件：
+强制重新运行 Beat This! 推理：
 
 ```powershell
-python compare_bpm.py "audio\Reply.mp3" -o bpm_results --reuse-inference
+python CCB.py "D:\Music\song.mp3" --refresh-cache
 ```
 
-该模式不会重新运行模型，但会重新生成 normalized CSV、click、图片、
-报告和汇总。音频路径、输出目录和歌曲文件名必须与首次运行一致。
+查看全部参数：
+
+```powershell
+python CCB.py --help
+```
+
+## Python 函数接口
+
+其他 Python 程序可直接调用 `API.run()`，无需构造 CLI 命令：
+
+```python
+from API import run, set_click_gain, set_music_gain
+
+set_music_gain(0.25)
+set_click_gain(0.75)
+result = run(r"D:\Music\song.mp3")
+print(result.beats_csv)
+print(result.click_wav)
+print(result.report["result"]["dominant_bpm"])
+```
+
+常用参数：
+
+```python
+result = run(
+    r"D:\Music\song.mp3",
+    output_dir="results",
+    cache_dir=None,
+    no_click=False,
+    refresh_cache=False,
+    device="cpu",
+    preserve_manual_edits=True,
+)
+```
+
+`run()` 每次处理一首歌，返回 `RunResult`。其中包含 `beats_csv`、`click_wav`、`overview_png`、`segments_csv`、`report_json` 的绝对路径，以及已解析的 `report` 字典。调用失败时会抛出异常，便于上层程序捕获和处理。单首 API 调用不会重写多歌汇总用的 `summary.csv`。
+
+`set_music_gain()` 和 `set_click_gain()` 设置后续 `run()` 调用的进程级默认值；未设置时使用 `0.1 / 0.9`。两个增益必须是非负有限数，且不能同时为零。它们只影响 `click.wav`，不会使 Beat This! 缓存失效。
+
+### 缓存管理函数
+
+```python
+from API import list_caches, prune_caches
+
+# 按最近使用时间从新到旧查询。
+caches = list_caches()
+
+# 预览：保留最近 10 个，其余将被删除。
+preview = prune_caches(keep=10, dry_run=True)
+
+# 正式清理。
+result = prune_caches(keep=10)
+print(result.deleted_count, result.freed_bytes)
+
+# 仅保留指定音频的缓存。
+prune_caches(keep=[r"D:\Music\song1.mp3", r"D:\Music\song2.wav"])
+
+# 删除全部缓存；下次 run() 将重新进行模型推理。
+prune_caches()
+```
+
+`list_caches()` 返回 `CacheEntry`，包含缓存目录、原音频路径、大小、最近使用时间及 `READY / INCOMPLETE / SOURCE_MISSING / INVALID` 状态。`prune_caches()` 只删除已确认位于缓存根目录下的直接子目录；建议大规模清理前先使用 `dry_run=True`。
+
+### 只读查询函数
+
+这些函数只读取已有结果，不运行模型、不改写输出，也不更新缓存使用时间：
+
+```python
+from API import (
+    get_manual_beat_edits,
+    get_result,
+    get_review_ranges,
+    inspect_song,
+    list_beats,
+    validate_result,
+)
+
+result = get_result(r"D:\Music\song.mp3")
+info = inspect_song(r"D:\Music\song.mp3")
+edits = get_manual_beat_edits(r"D:\Music\song.mp3")
+review_ranges = get_review_ranges(r"D:\Music\song.mp3")
+validation = validate_result(r"D:\Music\song.mp3")
+
+# 保留 beats.csv 中的原始 beat_id，只筛选 90–110 秒的手动拍点。
+beats = list_beats(
+    r"D:\Music\song.mp3",
+    start_seconds=90.0,
+    end_seconds=110.0,
+    manual_only=True,
+)
+```
+
+`list_beats()` 还支持 `reliability_class="MANUAL_EDIT"` 等可靠性分类筛选。`validate_result()` 返回错误与警告；缺少缓存只产生警告，因为现有正式结果在没有缓存时仍可正常读取。
+
+### 手动节拍函数
+
+首次 `run()` 后，可以直接管理当前的 `beats.csv`：
+
+```python
+from API import create_beat, delete_beat, list_beats, run, update_beat
+
+created = create_beat(r"D:\Music\song.mp3", 12.345, is_downbeat=False)
+updated = update_beat(
+    r"D:\Music\song.mp3",
+    created.beat_id,
+    time_seconds=12.400,
+    is_downbeat=True,
+)
+beats = list_beats(r"D:\Music\song.mp3")
+delete_beat(r"D:\Music\song.mp3", updated.beat_id)
+
+# 使用缓存重新生成 click、总览图和报告，同时保留上述手动编辑。
+result = run(r"D:\Music\song.mp3", preserve_manual_edits=True)
+```
+
+新增或调整后的时间不能与已有节拍重合，否则函数会抛出 `EditConflictError`（同时也是 `ValueError` 的子类）。每次变更后，所有节拍按时间重新编号为 `1..N`；新增和调整的行在 `beats.csv` 中标为 `MANUAL_EDIT`。删除记录保存在 `report.json`，因此再次运行时不会被自动网格恢复。
+
+`preserve_manual_edits=True` 是默认行为。设为 `False` 会丢弃全部手动操作并输出纯自动网格。`reset_beat_edits()` 只清除操作记录；随后调用一次 `run()` 才会恢复自动网格及相关最终文件。
+
+### NO_BEAT 函数
+
+需要先对音频成功执行至少一次 `run()`，然后可管理其 `NO_BEAT` 区间：
+
+```python
+from API import (
+    clear_no_beat_ranges,
+    create_no_beat_range,
+    delete_no_beat_range,
+    list_no_beat_ranges,
+    run,
+    update_no_beat_range,
+)
+
+created = create_no_beat_range(
+    r"D:\Music\song.mp3",
+    32.5,
+    40.0,
+    note="spoken section",
+)
+
+updated = update_no_beat_range(
+    r"D:\Music\song.mp3",
+    created.segment_id,
+    end_seconds=41.0,
+)
+
+ranges = list_no_beat_ranges(r"D:\Music\song.mp3")
+delete_no_beat_range(r"D:\Music\song.mp3", updated.segment_id)
+deleted_count = clear_no_beat_ranges(r"D:\Music\song.mp3")
+```
+
+每次创建、调整或删除后，所有 `NO_BEAT` 区间都会按开始时间重新编号为 `1..N`，因此 ID 是当前时间顺序号，不是永久标识。调整函数会返回该区间的新 ID。
+
+这些函数只会原子更新 `segments.csv`，不会运行模型或自动重建结果。修改完成后再调用一次 `run()`，即可复用现有缓存更新节拍、click 和报告。
+
+## 输出
+
+默认输出到 `results/`：
+
+```text
+results/
+  summary.csv
+  歌曲名-路径短哈希/
+    beats.csv
+    click.wav
+    overview.png
+    segments.csv
+    report.json
+```
+
+- `beats.csv`：唯一正式拍点结果，包含时间、downbeat、局部 BPM 和可靠性。
+- `click.wav`：原音乐与最终 click 混音；使用 `--no-click` 时不生成。
+- `overview.png`：拍点证据、最终网格、BPM 和可靠性的综合图。
+- `segments.csv`：用户可编辑的 `NO_BEAT` 区间。
+- `report.json`：整体 BPM、拍点数、可靠性摘要和建议检查区间。
+- `summary.csv`：多首歌的汇总表。
+
+新结果目录使用“可读文件名 + 8 位绝对路径哈希”，例如 `Aria-4d072156/`。因此不同目录中的同名音频可以共存。已经存在且元数据匹配的旧式 `results/Aria/` 会继续原地复用，不会自动迁移或丢失手动编辑。
+
+## 隐藏推理缓存
+
+新安装默认把 Beat This! 推理结果保存在操作系统的用户缓存目录中。这不是调试输出，而是重建最终结果所需的内部缓存。缓存位置优先级为：`run(cache_dir=...)` 或 CLI `--cache-dir`、环境变量 `CCB_CACHE_DIR`、系统用户缓存目录。
+
+新缓存目录同样使用“文件名 + 8 位绝对路径哈希”，防止仓库外不同位置的同名音频共享缓存。
+
+旧版本已经生成在输出目录旁 `.ccb-cache/` 中的缓存会继续被自动发现和复用，查询与清理函数也能看到它们，不会因升级而重新推理。
+
+修改 `segments.csv` 后重新执行同一条命令，CCB 会复用缓存，无需重新运行模型。只有更换音频、更改推理设置或显式使用 `--refresh-cache` 时才应刷新。
 
 ## 标注 NO_BEAT
 
-`__segments.csv` 默认包含一行覆盖全曲的 `no_beat=0`。用户可以追加
-`no_beat=1` 的区段；这些行优先于默认行，例如：
+首次运行会自动创建 `segments.csv`：
 
 ```csv
 segment_id,start_seconds,end_seconds,no_beat,source,note
-0,0.000000000,238.957000000,0,default,
-1,0.000000000,17.600000000,1,user,清唱前奏
-2,208.600000000,238.957000000,1,user,自由速度尾奏
+0,0.000000000,247.440000000,0,default,
 ```
 
-区间采用 `[start_seconds, end_seconds)` 语义。重处理后，`NO_BEAT` 区段：
+如需排除 32.5–40.0 秒，可增加：
 
-- 不输出 click；
-- 不参与主 BPM 和变速统计；
-- 不运行五档网格解码；
-- 不会跨越区段补拍；
-- 在图片中以灰色阴影显示。
-
-因此 `[120, 240)` 约束只适用于每个有效节拍区段内部，不适用于跨越
-`NO_BEAT` 空白的时间差。
-
-## 输出怎么看
-
-每首歌有一个独立子目录，其中包含：
-
-- `__beat-this-raw__beats.csv`：官方 30 秒分块、`keep_first` 拼接后的拍点；
-- `__beat-this-fused__beats.csv`：重叠窗口 Hann 加权融合后的拍点；
-- `__beat-this-normalized__beats.csv`：五层网格解码和最终间距约束后的拍点；
-- `__beat-this-phase-greedy__beats.csv`：C2 贪心相位路径，用作细化失败时的安全回退；
-- `__beat-this-phase-aware__beats.csv`：经过 C3 双向细化和 C4 连续性验证的相位路径；
-- 对应的 `__clicks.wav`：raw/fused/normalized 三套试听文件，高音点击代表 downbeat；
-- `__beat-this__frames.csv`：50 FPS 的 raw/fused beat、downbeat logits 和概率；
-- `__beat-this__grid.csv`：每个区间的基础 BPM、选中倍率、归一化 BPM 和置信度；
-- `__beat-this__reliability.csv`：P4 按时间段汇总的结果可靠性、声学支持度、
-  倍率切换次数和建议复核原因；
-- `__inference.csv`：FPS、窗口、hop、采样率和音频路径等推理元数据；
-- `__segments.csv`：用户或模型提供的有效节拍/`NO_BEAT` 时间段；
-- `__tempo.png`：raw/fused/normalized 三套拍点计算出的局部 BPM 对比；
-- `__probabilities.png`：raw/fused 逐帧 beat/downbeat 概率对比；
-- `__grid.png`：基础 BPM、倍率决策 BPM、最终实际 BPM 和选中网格倍率；
-- `__beat-this__p4-diagnostics.png`：把模型概率、原始/最终拍点、最终 BPM、
-  网格倍率和可靠性区段放在同一时间轴上；
-- `__report.json`：主导 BPM 和疑似变速区间；
-- 根目录 `summary.csv`：所有歌曲的 raw/fused/normalized 汇总，并包含有效时长和
-  `NO_BEAT` 时长。
-
-三套 beat CSV 都保存 `sample_index`、高精度时间、`activity_segment_id` 和
-`is_no_beat`。绘图与统计不读取 Python 推理内存，而是重新加载这些 CSV、
-`frames.csv`、`grid.csv` 和 `segments.csv` 后生成。
-
-判断好坏时，优先试听 normalized，并与 raw/fused 两套 `__clicks.wav` 做 A/B：如果点击声始终落在音乐拍点上，说明结果可信；只比较全局 BPM 会漏掉相位错误、漏拍以及变速片段。
-
-phase-aware 解码器逐拍维持相位连续性，并只在五个允许的倍率之间切换。
-C4 之后的区段起点不会再无条件固定为第一个 fused 拍点：如果开头后方 6 秒内
-存在至少 4 个高置信度拍点构成的稳定网格，并且它相对首拍相位有显著改善，
-解码器会用该未来网格反推区段首拍。该操作最多移动不到一个归一化周期，
-不会修改 Beat This! 原始 CSV，也不会恢复旧版机械删拍/填拍。
-对于中间的短异常段，解码器还会比较左右稳定锚点之间的实际拍数与预期拍数。
-只有窗口不超过 6 秒、两侧周期差不超过 6%、当前恰好多或少 1 拍、中间存在
-多次倍率切换或相位桥接，且正确拍数明显更符合两侧周期时，才会在固定两端之间
-均匀重建拍点。该修复会以 `anchor_count_reconciled` 写入 transition CSV，
-任何条件不满足都保持原结果。
-如果普通拍点在异常后仍不稳定，解码器还可以使用连续 4 个高置信度 downbeat
-比较相邻三个小节：仅当小节时长相近、拍数呈 `N → N±1 → N`、前后小节周期
-一致且中间存在低置信度或相位桥接证据时，才固定中间两个 downbeat 并重建
-异常小节。transition 的 `diagnostic_note` 会以 `source=downbeat_bars` 标明来源。
-C3 双向细化不会再经过旧版末端删拍/填拍规则。C4 在落盘前后检查时间顺序、
-活动区段归属、倍率合法性、`[120, 240)` 范围和相邻周期连续性；如果 C3
-细化没有通过校验，会回退到已经验证的 C2 贪心相位路径，而不会回退到旧版网格。
-P3-B 的修复结果仍会保存供诊断和试听，但不会作为正式网格的输入。
-
-P4 不再修改拍点，而是解释当前结果在哪些区段值得信任或需要人工复核。
-`__beat-this__reliability.csv` 使用五类标签：
-
-- `RELIABLE`：网格稳定，没有明显异常证据；
-- `PHASE_REPAIRED`：P3-C 使用了相位桥接或双向细化，结果可用但值得试听；
-- `TEMPO_MOTION`：检测到连贯的自然变速，不应当作单点尖峰删除；
-- `NO_BEAT`：用户在 `segments.csv` 中明确排除的区段；
-- `BEAT_THIS_UNRELIABLE`：倍率频繁切换、区间波动、低声学支持等证据表明
-  Beat This! 在该段可能不适用，建议人工试听或标成 `NO_BEAT`。
-
-这些标签和 `reliability_score` 只用于解释、筛选和后续用户界面展示，绝不会
-反过来增删或移动 `__beat-this-normalized__beats.csv` 中的拍点。
-
-## 关于“瞬时 BPM”
-
-原始瞬时值严格按照下式计算：
-
-```text
-raw_local_bpm = 60 / (当前节拍时间 - 上一个节拍时间)
+```csv
+1,32.500000000,40.000000000,1,user,spoken intro
 ```
 
-单个漏拍会让该值减半，额外误检会让它加倍。因此脚本还输出 `smoothed_local_bpm`：它只修正孤立的疑似半速/倍速异常，再应用 5 个节拍左右的中值滤波。原始值不会被覆盖。
+`no_beat=1` 的区间不参与最终网格、BPM 统计和 click 合成。重新执行命令即可从现有缓存快速重建结果。
 
-红色阴影表示相对主导速度偏离至少 8% 或 8 BPM、并持续至少 4 个节拍和 2 秒的候选片段。阈值可调整：
+## 可靠性
 
-```powershell
-python compare_bpm.py song.mp3 --change-ratio 0.05 --change-bpm 5 --min-change-beats 3
-```
+CCB 使用以下标签：
 
-精确的 2 倍/半速变化存在音乐层级歧义，例如 70 与 140 BPM 可能描述同一律动。自动标注只能作为候选，最终应结合点击声和 `raw_local_bpm` 判断。
+- `RELIABLE`
+- `PHASE_REPAIRED`
+- `TEMPO_MOTION`
+- `NO_BEAT`
+- `BEAT_THIS_UNRELIABLE`
+
+标签只用于提示和复核，不会另外改写最终拍点。

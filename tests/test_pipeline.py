@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-import compare_bpm as bpm
+import CCB as ccb
 
 
 class CsvPipelineTest(unittest.TestCase):
@@ -17,31 +17,91 @@ class CsvPipelineTest(unittest.TestCase):
         for time_seconds in self.beat_times:
             index = min(round(time_seconds * self.fps), frame_count - 1)
             logits[index] = 6.0
-        self.frames = bpm.FramePredictions(
+        self.frames = ccb.FramePredictions(
             fps=self.fps,
-            raw_beat_logits=logits.copy(),
-            raw_downbeat_logits=logits.copy(),
             fused_beat_logits=logits.copy(),
             fused_downbeat_logits=logits.copy(),
             window_seconds=30.0,
             hop_seconds=10.0,
             overlap_windows=1,
         )
-        self.result = bpm.BeatResult(
+        self.result = ccb.BeatResult(
             method="beat-this-fused",
             beat_times=self.beat_times,
             downbeat_times=self.beat_times[::4],
         )
 
+    def test_cli_exposes_only_the_production_output_contract(self) -> None:
+        parser = ccb.build_parser()
+        args = parser.parse_args(["song.mp3"])
+        option_strings = {
+            option
+            for action in parser._actions
+            for option in action.option_strings
+        }
+
+        self.assertEqual(args.output, Path("results"))
+        self.assertFalse(args.refresh_cache)
+        self.assertFalse(args.no_click)
+        self.assertIsNone(args.cache_dir)
+        self.assertEqual(args.music_gain, 0.1)
+        self.assertEqual(args.click_gain, 0.9)
+        self.assertIn("--refresh-cache", option_strings)
+        self.assertIn("--no-click", option_strings)
+        self.assertIn("--cache-dir", option_strings)
+        self.assertIn("--version", option_strings)
+        self.assertEqual(ccb.CCB_VERSION, "1.0.0")
+        self.assertNotIn("--output-profile", option_strings)
+        self.assertNotIn("--repair-mode", option_strings)
+        self.assertNotIn("--grid-mode", option_strings)
+
+        cache = ccb.inference_cache_paths(
+            Path("song.mp3"), args.output, Path("cache")
+        )
+        self.assertEqual(
+            cache["root"],
+            Path("cache") / ccb.audio_storage_key(Path("song.mp3")),
+        )
+        self.assertEqual(cache["metadata"].name, "inference.csv")
+        self.assertEqual(cache["frames"].name, "frames.csv")
+        self.assertEqual(cache["fused"].name, "fused_beats.csv")
+
+    def test_click_mix_uses_gains_and_prevents_clipping(self) -> None:
+        result = ccb.BeatResult(
+            method="ccb-final",
+            beat_times=np.asarray([0.0]),
+            downbeat_times=np.asarray([], dtype=float),
+        )
+        music = np.asarray([1.0, -1.0])
+        clicks = np.asarray([1.0, 1.0])
+
+        with (
+            patch.object(ccb.librosa, "clicks", return_value=clicks),
+            patch.object(ccb.librosa.util, "normalize", side_effect=lambda x: x),
+            patch.object(ccb.sf, "write") as write,
+        ):
+            ccb.write_click_track(
+                Path("click.wav"),
+                music,
+                22050,
+                result,
+                music_gain=1.0,
+                click_gain=1.0,
+            )
+
+        written = write.call_args.args[1]
+        np.testing.assert_allclose(written, np.asarray([1.0, 0.0]))
+        self.assertLessEqual(float(np.max(np.abs(written))), 1.0)
+
     def test_no_beat_ranges_split_grid_without_bridging(self) -> None:
         segments = [
-            bpm.ActivitySegment(0, 3.0, 6.0, True, "user", "test gap")
+            ccb.ActivitySegment(0, 3.0, 6.0, True, "user", "test gap")
         ]
-        ranges = bpm.active_ranges(segments, 10.0)
-        normalized, events, _ = bpm.build_phase_aware_grid(
+        ranges = ccb.active_ranges(segments, 10.0)
+        normalized, events, _ = ccb.build_phase_aware_grid(
             self.result, self.frames, ranges
         )
-        decoding = bpm.phase_events_to_grid_decoding(events)
+        decoding = ccb.phase_events_to_grid_decoding(events)
 
         self.assertEqual(ranges, [(0.0, 3.0), (6.0, 10.0)])
         self.assertFalse(
@@ -62,16 +122,15 @@ class CsvPipelineTest(unittest.TestCase):
                 & (normalized.beat_times <= end)
             ]
             local_bpm = 60.0 / np.diff(times)
-            self.assertTrue(np.all(local_bpm >= bpm.NORMALIZED_BPM_MIN))
-            self.assertTrue(np.all(local_bpm < bpm.NORMALIZED_BPM_MAX))
+            self.assertTrue(np.all(local_bpm >= ccb.NORMALIZED_BPM_MIN))
+            self.assertTrue(np.all(local_bpm < ccb.NORMALIZED_BPM_MAX))
 
     def test_csv_round_trip_preserves_inference_and_beats(self) -> None:
         ranges = [(0.0, 10.0)]
-        normalized, events, _ = bpm.build_phase_aware_grid(
+        normalized, events, _ = ccb.build_phase_aware_grid(
             self.result, self.frames, ranges
         )
-        decoding = bpm.phase_events_to_grid_decoding(events)
-        metadata = bpm.InferenceMetadata(
+        metadata = ccb.InferenceMetadata(
             fps=self.fps,
             window_seconds=30.0,
             hop_seconds=10.0,
@@ -83,22 +142,19 @@ class CsvPipelineTest(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            bpm.write_inference_metadata_csv(root / "metadata.csv", metadata)
-            bpm.write_frame_predictions_csv(root / "frames.csv", self.frames)
-            loaded_metadata = bpm.read_inference_metadata_csv(
+            ccb.write_inference_metadata_csv(root / "metadata.csv", metadata)
+            ccb.write_frame_predictions_csv(root / "frames.csv", self.frames)
+            loaded_metadata = ccb.read_inference_metadata_csv(
                 root / "metadata.csv"
             )
-            loaded_frames = bpm.read_frame_predictions_csv(
+            loaded_frames = ccb.read_frame_predictions_csv(
                 root / "frames.csv", loaded_metadata
             )
 
-            bpm.write_grid_decisions_csv(root / "grid.csv", decoding)
-            loaded_decoding = bpm.read_grid_decisions_csv(root / "grid.csv")
-
-            midpoints, raw_bpm, smooth_bpm = bpm.local_tempo(
+            midpoints, raw_bpm, smooth_bpm = ccb.local_tempo(
                 normalized.beat_times
             )
-            bpm.write_beats_csv(
+            ccb.write_beats_csv(
                 root / "beats.csv",
                 normalized,
                 midpoints,
@@ -107,7 +163,7 @@ class CsvPipelineTest(unittest.TestCase):
                 sample_rate=22050,
                 ranges=ranges,
             )
-            loaded_beats = bpm.read_beats_csv(
+            loaded_beats = ccb.read_beats_csv(
                 root / "beats.csv", "beat-this-normalized"
             )
 
@@ -116,123 +172,96 @@ class CsvPipelineTest(unittest.TestCase):
             len(self.frames.fused_beat_logits),
         )
         np.testing.assert_allclose(
-            loaded_decoding.base_bpm, decoding.base_bpm, atol=1e-4
-        )
-        np.testing.assert_allclose(
             loaded_beats.beat_times, normalized.beat_times, atol=1e-9
         )
 
+    def test_cache_fingerprint_rejects_changed_audio_or_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "song.wav"
+            audio.write_bytes(b"original-audio")
+            cache_paths = ccb.inference_cache_paths(
+                audio, root / "results", root / "cache"
+            )
+            cache_paths["root"].mkdir(parents=True)
+            audio_stat = audio.stat()
+            ccb.write_inference_metadata_csv(
+                cache_paths["metadata"],
+                ccb.InferenceMetadata(
+                    fps=50.0,
+                    window_seconds=30.0,
+                    hop_seconds=10.0,
+                    overlap_windows=1,
+                    sample_rate=22050,
+                    duration_seconds=1.0,
+                    audio_path=str(audio.resolve()),
+                    cache_schema_version=ccb.CACHE_SCHEMA_VERSION,
+                    audio_size_bytes=audio_stat.st_size,
+                    audio_mtime_ns=audio_stat.st_mtime_ns,
+                    checkpoint="final0",
+                    beat_this_version=ccb.beat_this_version(),
+                    ccb_version=ccb.CCB_VERSION,
+                ),
+            )
+            cache_paths["frames"].write_text("frames", encoding="utf-8")
+            cache_paths["fused"].write_text("beats", encoding="utf-8")
+
+            self.assertTrue(
+                ccb.inference_cache_available(
+                    audio,
+                    root / "results",
+                    root / "cache",
+                    sample_rate=22050,
+                    checkpoint="final0",
+                    hop_seconds=10.0,
+                )
+            )
+            self.assertFalse(
+                ccb.inference_cache_available(
+                    audio,
+                    root / "results",
+                    root / "cache",
+                    sample_rate=22050,
+                    checkpoint="other",
+                    hop_seconds=10.0,
+                )
+            )
+
+            audio.write_bytes(b"changed-audio-with-another-size")
+            self.assertFalse(
+                ccb.inference_cache_available(
+                    audio,
+                    root / "results",
+                    root / "cache",
+                    sample_rate=22050,
+                    checkpoint="final0",
+                    hop_seconds=10.0,
+                )
+            )
+
     def test_p3a_diagnostics_do_not_modify_fused_beats(self) -> None:
         beat_times = np.asarray([0.0, 0.7, 1.4, 2.8, 3.5, 4.2, 4.9, 5.6])
-        result = bpm.BeatResult("beat-this-fused", beat_times)
-        diagnostics, candidates = bpm.diagnose_fused_beats(
+        result = ccb.BeatResult("beat-this-fused", beat_times)
+        diagnostics = ccb.diagnose_fused_beats(
             result, self.frames, [(0.0, 6.0)]
         )
 
         self.assertEqual(len(diagnostics), len(beat_times) - 1)
         self.assertTrue(
-            any(item.candidate_type == "missing_beat" for item in candidates)
+            any(item.classification == "strong_outlier" for item in diagnostics)
         )
         np.testing.assert_array_equal(result.beat_times, beat_times)
 
-        off_result, _, off_decisions = bpm.apply_conservative_repairs(
-            result, candidates, [(0.0, 6.0)], "off"
-        )
-        np.testing.assert_array_equal(off_result.beat_times, beat_times)
-        self.assertTrue(any(item.status == "disabled" for item in off_decisions))
-
-    def test_p3b_preview_applies_only_to_repaired_interface(self) -> None:
-        beat_times = np.asarray([0.0, 0.7, 1.4, 2.8, 3.5, 4.2, 4.9, 5.6])
-        result = bpm.BeatResult("beat-this-fused", beat_times)
-        _, candidates = bpm.diagnose_fused_beats(
-            result, self.frames, [(0.0, 6.0)]
-        )
-        repaired_result, records, decisions = bpm.apply_conservative_repairs(
-            result, candidates, [(0.0, 6.0)], "preview"
-        )
-
-        np.testing.assert_array_equal(result.beat_times, beat_times)
-        self.assertIn(2.1, repaired_result.beat_times)
-        self.assertTrue(
-            any(item.status == "preview_applied" for item in decisions)
-        )
-
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            repaired = root / "repaired.csv"
-            decisions_path = root / "decisions.csv"
-            bpm.write_repaired_beats_csv(
-                repaired,
-                repaired_result,
-                records,
-                22050,
-                [(0.0, 6.0)],
-            )
-            bpm.write_repair_decisions_csv(decisions_path, decisions)
-            loaded = bpm.read_beats_csv(repaired, "beat-this-repaired")
-            loaded_decisions = bpm.read_repair_decisions_csv(decisions_path)
-
-        np.testing.assert_array_equal(loaded.beat_times, repaired_result.beat_times)
-        self.assertEqual(len(loaded_decisions), len(decisions))
-
-        repeated_result, _, repeated_decisions = bpm.apply_conservative_repairs(
-            result, candidates, [(0.0, 6.0)], "preview"
-        )
-        np.testing.assert_array_equal(
-            repeated_result.beat_times, repaired_result.beat_times
-        )
-        self.assertEqual(
-            [item.status for item in repeated_decisions],
-            [item.status for item in decisions],
-        )
-
-    def test_p3a_detects_extra_beat_and_protects_smooth_motion(self) -> None:
-        extra_times = np.asarray([0.0, 0.7, 1.05, 1.4, 2.1, 2.8, 3.5, 4.2])
-        _, extra_candidates = bpm.diagnose_fused_beats(
-            bpm.BeatResult("beat-this-fused", extra_times),
-            self.frames,
-            [(0.0, 5.0)],
-        )
-        self.assertTrue(
-            any(item.candidate_type == "extra_beat" for item in extra_candidates)
-        )
-        extra_repaired, _, extra_decisions = bpm.apply_conservative_repairs(
-            bpm.BeatResult("beat-this-fused", extra_times),
-            extra_candidates,
-            [(0.0, 5.0)],
-            "preview",
-        )
-        self.assertNotIn(1.05, extra_repaired.beat_times)
-        self.assertTrue(
-            any(
-                item.candidate_type == "extra_beat"
-                and item.status == "preview_applied"
-                for item in extra_decisions
-            )
-        )
-
+    def test_diagnostics_protect_smooth_tempo_motion(self) -> None:
         periods = np.asarray([0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.70])
         motion_times = np.concatenate(([0.0], np.cumsum(periods)))
-        diagnostics, motion_candidates = bpm.diagnose_fused_beats(
-            bpm.BeatResult("beat-this-fused", motion_times),
+        diagnostics = ccb.diagnose_fused_beats(
+            ccb.BeatResult("beat-this-fused", motion_times),
             self.frames,
             [(0.0, 5.0)],
         )
         self.assertTrue(
             any(item.classification == "protected_tempo_motion" for item in diagnostics)
-        )
-        self.assertTrue(
-            any(item.candidate_type == "tempo_motion" for item in motion_candidates)
-        )
-        motion_repaired, _, motion_decisions = bpm.apply_conservative_repairs(
-            bpm.BeatResult("beat-this-fused", motion_times),
-            motion_candidates,
-            [(0.0, 5.0)],
-            "preview",
-        )
-        np.testing.assert_array_equal(motion_repaired.beat_times, motion_times)
-        self.assertFalse(
-            any(item.status == "preview_applied" for item in motion_decisions)
         )
 
     def test_p3c_phase_grid_keeps_transition_intervals_continuous(self) -> None:
@@ -257,25 +286,25 @@ class CsvPipelineTest(unittest.TestCase):
                 4.94,
             ]
         )
-        result, events, transitions = bpm.build_phase_aware_grid(
-            bpm.BeatResult("beat-this-repaired", beat_times),
+        result, events, transitions = ccb.build_phase_aware_grid(
+            ccb.BeatResult("beat-this-repaired", beat_times),
             self.frames,
             [(0.0, 5.0)],
         )
         intervals = np.diff(result.beat_times)
 
-        self.assertTrue(np.all(intervals > 60.0 / bpm.NORMALIZED_BPM_MAX))
-        self.assertTrue(np.all(intervals <= 60.0 / bpm.NORMALIZED_BPM_MIN))
+        self.assertTrue(np.all(intervals > 60.0 / ccb.NORMALIZED_BPM_MAX))
+        self.assertTrue(np.all(intervals <= 60.0 / ccb.NORMALIZED_BPM_MIN))
         self.assertLess(float(np.max(intervals)), 0.45)
         self.assertTrue(
-            {item.selected_scale for item in events}.issubset(set(bpm.GRID_SCALES))
+            {item.selected_scale for item in events}.issubset(set(ccb.GRID_SCALES))
         )
         self.assertGreater(len(events), 10)
         self.assertIsInstance(transitions, list)
 
     def test_p3c_phase_grid_does_not_bridge_no_beat_ranges(self) -> None:
         ranges = [(0.0, 3.0), (6.0, 10.0)]
-        result, events, _ = bpm.build_phase_aware_grid(
+        result, events, _ = ccb.build_phase_aware_grid(
             self.result,
             self.frames,
             ranges,
@@ -296,10 +325,8 @@ class CsvPipelineTest(unittest.TestCase):
         logits = np.full(600, -6.0)
         for time_seconds in source_times:
             logits[round(time_seconds * self.fps)] = 6.0
-        frames = bpm.FramePredictions(
+        frames = ccb.FramePredictions(
             fps=self.fps,
-            raw_beat_logits=logits.copy(),
-            raw_downbeat_logits=np.full_like(logits, -6.0),
             fused_beat_logits=logits.copy(),
             fused_downbeat_logits=np.full_like(logits, -6.0),
             window_seconds=30.0,
@@ -307,8 +334,8 @@ class CsvPipelineTest(unittest.TestCase):
             overlap_windows=1,
         )
 
-        result, events, transitions = bpm.build_phase_aware_grid(
-            bpm.BeatResult("beat-this-fused", source_times),
+        result, events, transitions = ccb.build_phase_aware_grid(
+            ccb.BeatResult("beat-this-fused", source_times),
             frames,
             [(0.0, 6.0)],
         )
@@ -330,10 +357,8 @@ class CsvPipelineTest(unittest.TestCase):
         logits = np.full(600, -6.0)
         for time_seconds in source_times:
             logits[round(time_seconds * self.fps)] = 6.0
-        frames = bpm.FramePredictions(
+        frames = ccb.FramePredictions(
             fps=self.fps,
-            raw_beat_logits=logits.copy(),
-            raw_downbeat_logits=np.full_like(logits, -6.0),
             fused_beat_logits=logits.copy(),
             fused_downbeat_logits=np.full_like(logits, -6.0),
             window_seconds=30.0,
@@ -341,8 +366,8 @@ class CsvPipelineTest(unittest.TestCase):
             overlap_windows=1,
         )
 
-        result, events, transitions = bpm.build_phase_aware_grid(
-            bpm.BeatResult("beat-this-fused", source_times),
+        result, events, transitions = ccb.build_phase_aware_grid(
+            ccb.BeatResult("beat-this-fused", source_times),
             frames,
             [(0.0, 6.0)],
         )
@@ -358,10 +383,8 @@ class CsvPipelineTest(unittest.TestCase):
         logits = np.full(600, -6.0)
         for time_seconds in (0.36, 0.74, 1.16):
             logits[round(time_seconds * self.fps)] = 6.0
-        frames = bpm.FramePredictions(
+        frames = ccb.FramePredictions(
             fps=self.fps,
-            raw_beat_logits=logits.copy(),
-            raw_downbeat_logits=logits.copy(),
             fused_beat_logits=logits.copy(),
             fused_downbeat_logits=logits.copy(),
             window_seconds=30.0,
@@ -372,7 +395,7 @@ class CsvPipelineTest(unittest.TestCase):
         for index, time_seconds in enumerate(times):
             bridge = index == 2
             events.append(
-                bpm.PhaseGridEvent(
+                ccb.PhaseGridEvent(
                     grid_beat_index=index + 1,
                     activity_segment_id=0,
                     beat_time_seconds=float(time_seconds),
@@ -387,8 +410,8 @@ class CsvPipelineTest(unittest.TestCase):
                     path_cost=float(index),
                 )
             )
-        result, refined, transitions = bpm.refine_phase_grid_bidirectionally(
-            bpm.BeatResult("beat-this-phase-aware", times),
+        result, refined, transitions = ccb.refine_phase_grid_bidirectionally(
+            ccb.BeatResult("beat-this-phase-aware", times),
             events,
             [],
             frames,
@@ -401,30 +424,30 @@ class CsvPipelineTest(unittest.TestCase):
             any(item.transition_type == "bidirectional_bridge" for item in transitions)
         )
         intervals = np.diff(result.beat_times)
-        self.assertTrue(np.all(intervals > 60.0 / bpm.NORMALIZED_BPM_MAX))
-        self.assertTrue(np.all(intervals <= 60.0 / bpm.NORMALIZED_BPM_MIN))
+        self.assertTrue(np.all(intervals > 60.0 / ccb.NORMALIZED_BPM_MAX))
+        self.assertTrue(np.all(intervals <= 60.0 / ccb.NORMALIZED_BPM_MIN))
 
     def test_p3c4_invalid_refinement_falls_back_to_greedy_phase_grid(self) -> None:
-        greedy, events, transitions = bpm.build_phase_aware_grid(
+        greedy, events, transitions = ccb.build_phase_aware_grid(
             self.result,
             self.frames,
             [(0.0, 10.0)],
         )
         invalid_times = greedy.beat_times.copy()
         invalid_times[2] = invalid_times[1] + 0.10
-        invalid = bpm.BeatResult(
+        invalid = ccb.BeatResult(
             "beat-this-phase-aware",
             invalid_times,
             downbeat_times=greedy.downbeat_times,
         )
 
         with patch.object(
-            bpm,
+            ccb,
             "refine_phase_grid_bidirectionally",
             return_value=(invalid, events, transitions),
         ):
             result, final_events, _, applied, fallback, reason = (
-                bpm.finalize_phase_grid(
+                ccb.finalize_phase_grid(
                     greedy,
                     events,
                     transitions,
@@ -452,10 +475,8 @@ class CsvPipelineTest(unittest.TestCase):
         logits = np.full(round(12.5 * self.fps), -6.0)
         for time_seconds in correct_grid:
             logits[round(time_seconds * self.fps)] = 6.0
-        frames = bpm.FramePredictions(
+        frames = ccb.FramePredictions(
             fps=self.fps,
-            raw_beat_logits=logits.copy(),
-            raw_downbeat_logits=np.full_like(logits, -6.0),
             fused_beat_logits=logits.copy(),
             fused_downbeat_logits=np.full_like(logits, -6.0),
             window_seconds=30.0,
@@ -466,7 +487,7 @@ class CsvPipelineTest(unittest.TestCase):
         for index, time_seconds in enumerate(times):
             is_bridge = time_seconds in bridges
             events.append(
-                bpm.PhaseGridEvent(
+                ccb.PhaseGridEvent(
                     grid_beat_index=index + 1,
                     activity_segment_id=0,
                     beat_time_seconds=float(time_seconds),
@@ -484,8 +505,8 @@ class CsvPipelineTest(unittest.TestCase):
                 )
             )
 
-        result, refined, transitions = bpm.refine_phase_grid_bidirectionally(
-            bpm.BeatResult("beat-this-phase-aware", times),
+        result, refined, transitions = ccb.refine_phase_grid_bidirectionally(
+            ccb.BeatResult("beat-this-phase-aware", times),
             events,
             [],
             frames,
@@ -519,7 +540,7 @@ class CsvPipelineTest(unittest.TestCase):
         for index, time_seconds in enumerate(times):
             in_middle = left_anchor < time_seconds < right_anchor
             events.append(
-                bpm.PhaseGridEvent(
+                ccb.PhaseGridEvent(
                     grid_beat_index=index + 1,
                     activity_segment_id=0,
                     beat_time_seconds=float(time_seconds),
@@ -542,7 +563,7 @@ class CsvPipelineTest(unittest.TestCase):
             (5.50, 6.50, "phase_bridge", 1.0, 1.0),
         )
         transitions = [
-            bpm.GridTransition(
+            ccb.GridTransition(
                 transition_id=index + 1,
                 activity_segment_id=0,
                 start_seconds=start,
@@ -564,7 +585,7 @@ class CsvPipelineTest(unittest.TestCase):
             ) in enumerate(transition_specs)
         ]
 
-        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+        repaired, repaired_transitions = ccb.reconcile_anchor_beat_counts(
             events,
             transitions,
             self.frames,
@@ -596,7 +617,7 @@ class CsvPipelineTest(unittest.TestCase):
         right_times = right_anchor + np.arange(0, 7, dtype=float) * 0.38
         times = np.concatenate((left_times, sparse_middle, right_times))
         events = [
-            bpm.PhaseGridEvent(
+            ccb.PhaseGridEvent(
                 grid_beat_index=index + 1,
                 activity_segment_id=0,
                 beat_time_seconds=float(time_seconds),
@@ -623,7 +644,7 @@ class CsvPipelineTest(unittest.TestCase):
             for index, time_seconds in enumerate(times)
         ]
         transitions = [
-            bpm.GridTransition(
+            ccb.GridTransition(
                 transition_id=index + 1,
                 activity_segment_id=0,
                 start_seconds=start,
@@ -641,7 +662,7 @@ class CsvPipelineTest(unittest.TestCase):
             )
         ]
 
-        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+        repaired, repaired_transitions = ccb.reconcile_anchor_beat_counts(
             events,
             transitions,
             self.frames,
@@ -680,7 +701,7 @@ class CsvPipelineTest(unittest.TestCase):
             in_bad_bar = downbeats[1] < time_seconds < downbeats[2]
             is_downbeat = bool(np.any(np.isclose(time_seconds, downbeats)))
             events.append(
-                bpm.PhaseGridEvent(
+                ccb.PhaseGridEvent(
                     grid_beat_index=index + 1,
                     activity_segment_id=0,
                     beat_time_seconds=float(time_seconds),
@@ -696,7 +717,7 @@ class CsvPipelineTest(unittest.TestCase):
                 )
             )
         transitions = [
-            bpm.GridTransition(
+            ccb.GridTransition(
                 transition_id=index + 1,
                 activity_segment_id=0,
                 start_seconds=float(start),
@@ -714,7 +735,7 @@ class CsvPipelineTest(unittest.TestCase):
             )
         ]
 
-        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+        repaired, repaired_transitions = ccb.reconcile_anchor_beat_counts(
             events,
             transitions,
             self.frames,
@@ -753,7 +774,7 @@ class CsvPipelineTest(unittest.TestCase):
             )
             return (0.90 if is_right_peak else 0.60, 0.0)
 
-        collapsed, runs = bpm._collapse_repeated_close_doublets(
+        collapsed, runs = ccb._collapse_repeated_close_doublets(
             times,
             probabilities,
         )
@@ -781,10 +802,8 @@ class CsvPipelineTest(unittest.TestCase):
             index = min(round(time_seconds * self.fps), frame_count - 1)
             beat_logits[index] = 6.0
             downbeat_logits[index] = 6.0
-        frames = bpm.FramePredictions(
+        frames = ccb.FramePredictions(
             fps=self.fps,
-            raw_beat_logits=beat_logits.copy(),
-            raw_downbeat_logits=downbeat_logits.copy(),
             fused_beat_logits=beat_logits.copy(),
             fused_downbeat_logits=downbeat_logits.copy(),
             window_seconds=30.0,
@@ -796,7 +815,7 @@ class CsvPipelineTest(unittest.TestCase):
             is_downbeat = bool(np.any(np.isclose(time_seconds, downbeats)))
             in_bad_bar = downbeats[1] < time_seconds < downbeats[2]
             events.append(
-                bpm.PhaseGridEvent(
+                ccb.PhaseGridEvent(
                     grid_beat_index=index + 1,
                     activity_segment_id=0,
                     beat_time_seconds=float(time_seconds),
@@ -812,7 +831,7 @@ class CsvPipelineTest(unittest.TestCase):
                 )
             )
         transitions = [
-            bpm.GridTransition(
+            ccb.GridTransition(
                 transition_id=index + 1,
                 activity_segment_id=0,
                 start_seconds=float(start),
@@ -830,7 +849,7 @@ class CsvPipelineTest(unittest.TestCase):
             )
         ]
 
-        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+        repaired, repaired_transitions = ccb.reconcile_anchor_beat_counts(
             events,
             transitions,
             frames,
@@ -853,7 +872,7 @@ class CsvPipelineTest(unittest.TestCase):
     def test_p4_marks_scale_churn_as_unreliable_without_changing_beats(self) -> None:
         times = np.arange(0.0, 12.01, 0.30)
         events = [
-            bpm.PhaseGridEvent(
+            ccb.PhaseGridEvent(
                 grid_beat_index=index + 1,
                 activity_segment_id=0,
                 beat_time_seconds=float(time_seconds),
@@ -870,7 +889,7 @@ class CsvPipelineTest(unittest.TestCase):
             for index, time_seconds in enumerate(times)
         ]
         transitions = [
-            bpm.GridTransition(
+            ccb.GridTransition(
                 transition_id=index + 1,
                 activity_segment_id=0,
                 start_seconds=time_seconds - 0.2,
@@ -886,7 +905,7 @@ class CsvPipelineTest(unittest.TestCase):
             for index, time_seconds in enumerate((4.4, 4.8, 6.4, 6.8))
         ]
         original_times = np.asarray([item.beat_time_seconds for item in events])
-        reliability = bpm.build_reliability_segments(
+        reliability = ccb.build_reliability_segments(
             events,
             transitions,
             [],
@@ -912,7 +931,7 @@ class CsvPipelineTest(unittest.TestCase):
             (np.arange(0.0, 3.0, 0.3), np.arange(5.0, 8.01, 0.3))
         ):
             events.extend(
-                bpm.PhaseGridEvent(
+                ccb.PhaseGridEvent(
                     grid_beat_index=len(events) + 1,
                     activity_segment_id=activity_id,
                     beat_time_seconds=float(time_seconds),
@@ -928,13 +947,13 @@ class CsvPipelineTest(unittest.TestCase):
                 )
                 for time_seconds in times
             )
-        reliability = bpm.build_reliability_segments(
+        reliability = ccb.build_reliability_segments(
             events,
             [],
             [],
             [(0.0, 3.0), (5.0, 8.0)],
             [(3.0, 5.0)],
-            [bpm.ActivitySegment(1, 3.0, 5.0, True, "user", "silent bridge")],
+            [ccb.ActivitySegment(1, 3.0, 5.0, True, "user", "silent bridge")],
         )
         no_beat = [item for item in reliability if item.classification == "NO_BEAT"]
 
