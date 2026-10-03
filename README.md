@@ -10,8 +10,8 @@ then builds a continuous, audible, and reviewable beat grid whose final tempo
 is normalized to the `[120, 240)` BPM range.
 
 CCB exposes one final result instead of a collection of intermediate pipeline
-artifacts. It can be used from the command line or through the functions in
-`API.py`.
+artifacts. It can be used from the command line or through the
+`context_calibrated_beats` Python API.
 
 ## Features
 
@@ -27,18 +27,26 @@ artifacts. It can be used from the command line or through the functions in
 
 ## Installation
 
-CCB supports Python 3.10–3.12. A virtual environment is recommended:
+CCB supports Python 3.10–3.12. A virtual environment is recommended.
+
+Windows:
 
 ```powershell
-git clone https://github.com/THU-Ichin/Context-Calibrated-Beats.git
-cd Context-Calibrated-Beats
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install context-calibrated-beats
 ```
 
-On Linux or macOS, replace the Python path in the last two commands with
-`.venv/bin/python`.
+Linux/macOS:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install context-calibrated-beats
+```
+
+To install the current source checkout instead, replace the package name with
+`-e .` in the final command.
 
 ## CLI
 
@@ -65,7 +73,7 @@ audio path to distinguish files with the same name in different directories.
 ## Python API
 
 ```python
-from API import run, set_click_gain, set_music_gain
+from context_calibrated_beats import run, set_click_gain, set_music_gain
 
 set_music_gain(0.1)
 set_click_gain(0.9)
@@ -141,3 +149,5 @@ CCB is released by Ichin under the [MIT License](LICENSE). Beat This! and other
 dependencies retain their respective licenses; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Users are responsible for
 having the rights required to process their input audio.
+
+Release history is recorded in [CHANGELOG.md](CHANGELOG.md).

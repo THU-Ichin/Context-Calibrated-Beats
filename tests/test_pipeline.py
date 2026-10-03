@@ -50,7 +50,7 @@ class CsvPipelineTest(unittest.TestCase):
         self.assertIn("--no-click", option_strings)
         self.assertIn("--cache-dir", option_strings)
         self.assertIn("--version", option_strings)
-        self.assertEqual(ccb.CCB_VERSION, "1.0.0")
+        self.assertEqual(ccb.CCB_VERSION, "1.0.1")
         self.assertNotIn("--output-profile", option_strings)
         self.assertNotIn("--repair-mode", option_strings)
         self.assertNotIn("--grid-mode", option_strings)

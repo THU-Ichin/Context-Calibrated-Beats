@@ -6,9 +6,17 @@ import unittest
 from unittest.mock import patch
 
 import API as api
+import context_calibrated_beats as package_api
+from context_calibrated_beats import api as package_api_module
 
 
 class ApiTest(unittest.TestCase):
+    def test_standard_package_namespace_exposes_the_public_api(self) -> None:
+        self.assertIs(package_api.run, api.run)
+        self.assertIs(package_api_module.run, api.run)
+        self.assertEqual(package_api.__version__, "1.0.1")
+        self.assertIn("run", package_api.__all__)
+
     def test_public_errors_keep_standard_exception_compatibility(self) -> None:
         self.assertTrue(issubclass(api.InvalidArgumentError, ValueError))
         self.assertTrue(issubclass(api.ResourceNotFoundError, FileNotFoundError))

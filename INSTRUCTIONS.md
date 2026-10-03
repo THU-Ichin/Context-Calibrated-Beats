@@ -11,57 +11,74 @@ The application keeps one final result and does not emit historical `raw`,
 
 ## Environment
 
-CCB supports Python 3.10–3.12. Python 3.12 is recommended:
+CCB supports Python 3.10–3.12. Python 3.12 and a virtual environment are
+recommended.
+
+Windows:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install context-calibrated-beats
 ```
+
+Linux/macOS:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install context-calibrated-beats
+```
+
+To install the current source checkout instead, replace the package name with
+`-e .` in the final command.
 
 ## Basic usage
 
 Process one song:
 
 ```powershell
-python CCB.py "D:\Music\song.mp3"
+ccb "D:\Music\song.mp3"
 ```
 
 Process multiple songs:
 
 ```powershell
-python CCB.py "D:\Music\song1.mp3" "D:\Music\song2.wav"
+ccb "D:\Music\song1.mp3" "D:\Music\song2.wav"
 ```
 
 Choose an output directory:
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" -o results
+ccb "D:\Music\song.mp3" -o results
 ```
 
 Use a GPU:
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" --beat-this-device cuda
+ccb "D:\Music\song.mp3" --beat-this-device cuda
 ```
 
 Skip click-track generation:
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" --no-click
+ccb "D:\Music\song.mp3" --no-click
 ```
 
 Force fresh Beat This! inference:
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" --refresh-cache
+ccb "D:\Music\song.mp3" --refresh-cache
 ```
 
 Show all options:
 
 ```powershell
-python CCB.py --help
+ccb --help
 ```
+
+From a source checkout, `python CCB.py ...` remains available as a compatible
+entry point.
 
 ## Python function API
 
@@ -69,7 +86,7 @@ Other Python programs can call `API.run()` directly instead of constructing a
 CLI command:
 
 ```python
-from API import run, set_click_gain, set_music_gain
+from context_calibrated_beats import run, set_click_gain, set_music_gain
 
 set_music_gain(0.25)
 set_click_gain(0.75)
@@ -107,7 +124,7 @@ not invalidate the Beat This! inference cache.
 ### Cache management
 
 ```python
-from API import list_caches, prune_caches
+from context_calibrated_beats import list_caches, prune_caches
 
 # List caches from most recently used to oldest.
 caches = list_caches()
@@ -137,7 +154,7 @@ These functions read existing results without running the model, rewriting
 outputs, or updating the cache's last-used time:
 
 ```python
-from API import (
+from context_calibrated_beats import (
     get_manual_beat_edits,
     get_result,
     get_review_ranges,
@@ -172,7 +189,13 @@ After the first successful `run()`, the current `beats.csv` can be managed
 directly:
 
 ```python
-from API import create_beat, delete_beat, list_beats, run, update_beat
+from context_calibrated_beats import (
+    create_beat,
+    delete_beat,
+    list_beats,
+    run,
+    update_beat,
+)
 
 created = create_beat(r"D:\Music\song.mp3", 12.345, is_downbeat=False)
 updated = update_beat(
@@ -204,7 +227,7 @@ grid and its related final files.
 Run the audio successfully at least once before managing its `NO_BEAT` ranges:
 
 ```python
-from API import (
+from context_calibrated_beats import (
     clear_no_beat_ranges,
     create_no_beat_range,
     delete_no_beat_range,

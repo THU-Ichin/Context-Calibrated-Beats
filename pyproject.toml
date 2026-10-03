@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,11 +7,13 @@ name = "context-calibrated-beats"
 dynamic = ["version"]
 description = "Automatic Beat Tracking, Calibration and Click Generation"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.13"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
   { name = "Ichin" },
 ]
+keywords = ["audio", "beat tracking", "downbeat", "bpm", "click track"]
 dependencies = [
   "numpy>=1.26",
   "scipy>=1.11",
@@ -23,7 +25,6 @@ dependencies = [
 ]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -35,12 +36,14 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/THU-Ichin/Context-Calibrated-Beats"
 Issues = "https://github.com/THU-Ichin/Context-Calibrated-Beats/issues"
+Changelog = "https://github.com/THU-Ichin/Context-Calibrated-Beats/blob/main/CHANGELOG.md"
 
 [project.scripts]
-ccb = "CCB:main"
+ccb = "context_calibrated_beats.cli:main"
 
 [tool.setuptools]
 py-modules = ["API", "CCB"]
+packages = ["context_calibrated_beats"]
 
 [tool.setuptools.dynamic]
 version = { attr = "CCB.CCB_VERSION" }

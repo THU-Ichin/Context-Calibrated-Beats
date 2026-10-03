@@ -8,64 +8,78 @@ CCB（Context Calibrated Beats）是一个离线音乐节拍网格工具。它�
 
 ## 环境
 
-支持 Python 3.10–3.12，建议使用 Python 3.12：
+支持 Python 3.10–3.12，建议使用 Python 3.12 和虚拟环境。
+
+Windows：
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install context-calibrated-beats
 ```
+
+Linux/macOS：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install context-calibrated-beats
+```
+
+如需安装当前源码目录，请将最后一条命令中的包名替换为 `-e .`。
 
 ## 基本用法
 
 处理一首歌：
 
 ```powershell
-python CCB.py "D:\Music\song.mp3"
+ccb "D:\Music\song.mp3"
 ```
 
 同时处理多首歌：
 
 ```powershell
-python CCB.py "D:\Music\song1.mp3" "D:\Music\song2.wav"
+ccb "D:\Music\song1.mp3" "D:\Music\song2.wav"
 ```
 
 指定输出目录：
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" -o results
+ccb "D:\Music\song.mp3" -o results
 ```
 
 使用 GPU：
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" --beat-this-device cuda
+ccb "D:\Music\song.mp3" --beat-this-device cuda
 ```
 
 不生成 click 音轨：
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" --no-click
+ccb "D:\Music\song.mp3" --no-click
 ```
 
 强制重新运行 Beat This! 推理：
 
 ```powershell
-python CCB.py "D:\Music\song.mp3" --refresh-cache
+ccb "D:\Music\song.mp3" --refresh-cache
 ```
 
 查看全部参数：
 
 ```powershell
-python CCB.py --help
+ccb --help
 ```
+
+在源码目录中仍可使用兼容入口 `python CCB.py ...`。
 
 ## Python 函数接口
 
 其他 Python 程序可直接调用 `API.run()`，无需构造 CLI 命令：
 
 ```python
-from API import run, set_click_gain, set_music_gain
+from context_calibrated_beats import run, set_click_gain, set_music_gain
 
 set_music_gain(0.25)
 set_click_gain(0.75)
@@ -96,7 +110,7 @@ result = run(
 ### 缓存管理函数
 
 ```python
-from API import list_caches, prune_caches
+from context_calibrated_beats import list_caches, prune_caches
 
 # 按最近使用时间从新到旧查询。
 caches = list_caches()
@@ -122,7 +136,7 @@ prune_caches()
 这些函数只读取已有结果，不运行模型、不改写输出，也不更新缓存使用时间：
 
 ```python
-from API import (
+from context_calibrated_beats import (
     get_manual_beat_edits,
     get_result,
     get_review_ranges,
@@ -153,7 +167,13 @@ beats = list_beats(
 首次 `run()` 后，可以直接管理当前的 `beats.csv`：
 
 ```python
-from API import create_beat, delete_beat, list_beats, run, update_beat
+from context_calibrated_beats import (
+    create_beat,
+    delete_beat,
+    list_beats,
+    run,
+    update_beat,
+)
 
 created = create_beat(r"D:\Music\song.mp3", 12.345, is_downbeat=False)
 updated = update_beat(
@@ -178,7 +198,7 @@ result = run(r"D:\Music\song.mp3", preserve_manual_edits=True)
 需要先对音频成功执行至少一次 `run()`，然后可管理其 `NO_BEAT` 区间：
 
 ```python
-from API import (
+from context_calibrated_beats import (
     clear_no_beat_ranges,
     create_no_beat_range,
     delete_no_beat_range,

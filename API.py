@@ -2,7 +2,7 @@
 
 Example:
 
-    from API import run, set_click_gain, set_music_gain
+    from context_calibrated_beats import run, set_click_gain, set_music_gain
 
     set_music_gain(0.25)
     set_click_gain(0.75)

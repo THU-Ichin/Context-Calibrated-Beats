@@ -8,7 +8,7 @@ CCB 是一个离线音乐节拍网格工具。它使用
 [Beat This!](https://github.com/CPJKU/beat_this) 生成 beat/downbeat，再构建连续、
 可试听、可检查的节拍网格，并将最终速度归一化到 `[120, 240)` BPM。
 
-CCB 只保留一套最终结果，不向用户输出各个历史处理阶段。它既可以作为命令行工具使用，也可以通过 `API.py` 中的函数调用。
+CCB 只保留一套最终结果，不向用户输出各个历史处理阶段。它既可以作为命令行工具使用，也可以通过 `context_calibrated_beats` Python API 调用。
 
 ## 功能
 
@@ -21,17 +21,25 @@ CCB 只保留一套最终结果，不向用户输出各个历史处理阶段。�
 
 ## 安装
 
-需要 Python 3.10–3.12。建议使用虚拟环境：
+需要 Python 3.10–3.12，建议使用虚拟环境。
+
+Windows：
 
 ```powershell
-git clone https://github.com/THU-Ichin/Context-Calibrated-Beats.git
-cd Context-Calibrated-Beats
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install context-calibrated-beats
 ```
 
-Linux/macOS 请将最后两条命令中的 Python 路径换为 `.venv/bin/python`。
+Linux/macOS：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install context-calibrated-beats
+```
+
+如需安装当前源码目录，请将最后一条命令中的包名替换为 `-e .`。
 
 ## CLI
 
@@ -56,7 +64,7 @@ python CCB.py "D:\Music\song.mp3"
 ## Python API
 
 ```python
-from API import run, set_click_gain, set_music_gain
+from context_calibrated_beats import run, set_click_gain, set_music_gain
 
 set_music_gain(0.1)
 set_click_gain(0.9)
@@ -127,3 +135,5 @@ python -m unittest discover -s tests
 CCB 由 Ichin 以 [MIT License](LICENSE) 发布。Beat This! 及其他依赖保留各自许可；
 详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。用户应确保自己有权处理输入
 音频。
+
+版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。
