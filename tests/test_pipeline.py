@@ -508,6 +508,163 @@ class CsvPipelineTest(unittest.TestCase):
             any(item.event_source == "future_confirmed_backtrack" for item in refined)
         )
 
+    def test_p3c_reconciles_one_extra_beat_between_stable_anchors(self) -> None:
+        left_times = np.arange(0.0, 2.2801, 0.38)
+        left_anchor = float(left_times[-1])
+        right_anchor = 6.84
+        crowded_middle = np.linspace(left_anchor, right_anchor, 14)[1:-1]
+        right_times = right_anchor + np.arange(0, 7, dtype=float) * 0.38
+        times = np.concatenate((left_times, crowded_middle, right_times))
+        events = []
+        for index, time_seconds in enumerate(times):
+            in_middle = left_anchor < time_seconds < right_anchor
+            events.append(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=index + 1,
+                    activity_segment_id=0,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=(2.0 if time_seconds < 5.0 else 1.0),
+                    target_period_seconds=0.38,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=0.95 if not in_middle else 0.10,
+                    downbeat_probability=0.0,
+                    event_source="phase_bridge" if in_middle else "acoustic_peak",
+                    transition_type="phase_bridge" if in_middle else "stable",
+                    path_cost=float(index),
+                )
+            )
+        transition_specs = (
+            (2.28, 3.10, "phase_bridge", 2.0, 2.0),
+            (3.10, 3.90, "scale_switch", 2.0, 0.5),
+            (3.90, 4.70, "scale_switch", 0.5, 2.0),
+            (4.70, 5.50, "bidirectional_bridge", 2.0, 1.0),
+            (5.50, 6.50, "phase_bridge", 1.0, 1.0),
+        )
+        transitions = [
+            bpm.GridTransition(
+                transition_id=index + 1,
+                activity_segment_id=0,
+                start_seconds=start,
+                end_seconds=end,
+                previous_scale=previous_scale,
+                next_scale=next_scale,
+                previous_period_seconds=0.38,
+                next_period_seconds=0.35,
+                phase_adjustment_seconds=0.04,
+                transition_type=transition_type,
+                diagnostic_note="synthetic count error",
+            )
+            for index, (
+                start,
+                end,
+                transition_type,
+                previous_scale,
+                next_scale,
+            ) in enumerate(transition_specs)
+        ]
+
+        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+            events,
+            transitions,
+            self.frames,
+        )
+        repaired_times = np.asarray(
+            [item.beat_time_seconds for item in repaired], dtype=float
+        )
+        left_index = int(np.flatnonzero(np.isclose(repaired_times, left_anchor))[0])
+        right_index = int(np.flatnonzero(np.isclose(repaired_times, right_anchor))[0])
+
+        self.assertEqual(right_index - left_index, 12)
+        np.testing.assert_allclose(
+            np.diff(repaired_times[left_index : right_index + 1]),
+            0.38,
+            atol=1e-9,
+        )
+        self.assertTrue(
+            any(
+                item.transition_type == "anchor_count_reconciled"
+                for item in repaired_transitions
+            )
+        )
+
+    def test_p3c_reconciles_one_missing_beat_between_stable_anchors(self) -> None:
+        left_times = np.arange(0.0, 2.2801, 0.38)
+        left_anchor = float(left_times[-1])
+        right_anchor = 6.84
+        sparse_middle = np.linspace(left_anchor, right_anchor, 12)[1:-1]
+        right_times = right_anchor + np.arange(0, 7, dtype=float) * 0.38
+        times = np.concatenate((left_times, sparse_middle, right_times))
+        events = [
+            bpm.PhaseGridEvent(
+                grid_beat_index=index + 1,
+                activity_segment_id=0,
+                beat_time_seconds=float(time_seconds),
+                selected_scale=1.0,
+                target_period_seconds=0.38,
+                predicted_time_seconds=float(time_seconds),
+                phase_residual_seconds=0.0,
+                beat_probability=(
+                    0.10 if left_anchor < time_seconds < right_anchor else 0.95
+                ),
+                downbeat_probability=0.0,
+                event_source=(
+                    "phase_bridge"
+                    if left_anchor < time_seconds < right_anchor
+                    else "acoustic_peak"
+                ),
+                transition_type=(
+                    "phase_bridge"
+                    if left_anchor < time_seconds < right_anchor
+                    else "stable"
+                ),
+                path_cost=float(index),
+            )
+            for index, time_seconds in enumerate(times)
+        ]
+        transitions = [
+            bpm.GridTransition(
+                transition_id=index + 1,
+                activity_segment_id=0,
+                start_seconds=start,
+                end_seconds=end,
+                previous_scale=1.0,
+                next_scale=1.0,
+                previous_period_seconds=0.38,
+                next_period_seconds=0.41,
+                phase_adjustment_seconds=0.04,
+                transition_type="phase_bridge",
+                diagnostic_note="synthetic missing beat",
+            )
+            for index, (start, end) in enumerate(
+                ((2.28, 3.10), (3.10, 4.10), (4.10, 5.10), (5.10, 6.50))
+            )
+        ]
+
+        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+            events,
+            transitions,
+            self.frames,
+        )
+        repaired_times = np.asarray(
+            [item.beat_time_seconds for item in repaired], dtype=float
+        )
+        left_index = int(np.flatnonzero(np.isclose(repaired_times, left_anchor))[0])
+        right_index = int(np.flatnonzero(np.isclose(repaired_times, right_anchor))[0])
+
+        self.assertEqual(right_index - left_index, 12)
+        np.testing.assert_allclose(
+            np.diff(repaired_times[left_index : right_index + 1]),
+            0.38,
+            atol=1e-9,
+        )
+        self.assertTrue(
+            any(
+                item.transition_type == "anchor_count_reconciled"
+                for item in repaired_transitions
+            )
+        )
+
     def test_p4_marks_scale_churn_as_unreliable_without_changing_beats(self) -> None:
         times = np.arange(0.0, 12.01, 0.30)
         events = [

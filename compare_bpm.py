@@ -15,6 +15,8 @@ Its optional bidirectional pass jointly
 refines bridge beats and can use a stable future window to backtrack across an
 internally mis-phased region. P3-C4 validates that grid and falls back only to
 the validated greedy phase path, never to mechanical legacy normalization.
+Short transition regions can also reconcile a one-beat count mismatch between
+compatible stable anchors without enabling general long backtracking.
 P4 adds CSV-backed reliability labels and a unified diagnostic plot without
 changing any beat in the validated grid.
 
@@ -1563,6 +1565,288 @@ def build_phase_aware_grid(
     return result, events, transitions
 
 
+def reconcile_anchor_beat_counts(
+    events: list[PhaseGridEvent],
+    transitions: list[GridTransition],
+    frames: FramePredictions,
+) -> tuple[list[PhaseGridEvent], list[GridTransition]]:
+    """Repair a one-beat count error between two short, stable anchor windows."""
+    reconciled = [PhaseGridEvent(**asdict(item)) for item in events]
+    reconciled_transitions = [
+        GridTransition(**asdict(item)) for item in transitions
+    ]
+    beat_probability = expit(frames.fused_beat_logits)
+    downbeat_probability = expit(frames.fused_downbeat_logits)
+    minimum_period = 60.0 / NORMALIZED_BPM_MAX + 1e-4
+    maximum_period = 60.0 / NORMALIZED_BPM_MIN
+    suspect_types = {"scale_switch", "phase_bridge", "bidirectional_bridge"}
+
+    def probabilities(time_seconds: float) -> tuple[float, float]:
+        index = _frame_index(time_seconds, frames)
+        return float(beat_probability[index]), float(downbeat_probability[index])
+
+    def unstable_event(item: PhaseGridEvent) -> bool:
+        return (
+            item.event_source in {"phase_bridge", "bidirectional_refined"}
+            or item.transition_type
+            in {"phase_bridge", "scale_switch", "bidirectional_bridge"}
+        )
+
+    candidates: list[tuple[int, int, int, int, float, float, int, int]] = []
+    for segment_id in sorted({item.activity_segment_id for item in reconciled}):
+        segment_indices = [
+            index
+            for index, item in enumerate(reconciled)
+            if item.activity_segment_id == segment_id
+        ]
+        if len(segment_indices) < 16:
+            continue
+        local_events = [reconciled[index] for index in segment_indices]
+        local_transitions = sorted(
+            [
+                item
+                for item in reconciled_transitions
+                if item.activity_segment_id == segment_id
+                and item.transition_type in suspect_types
+            ],
+            key=lambda item: (item.start_seconds, item.end_seconds),
+        )
+        clusters: list[list[GridTransition]] = []
+        for item in local_transitions:
+            current_end = (
+                max(value.end_seconds for value in clusters[-1])
+                if clusters
+                else -math.inf
+            )
+            current_start = (
+                min(value.start_seconds for value in clusters[-1])
+                if clusters
+                else math.inf
+            )
+            if (
+                clusters
+                and item.start_seconds <= current_end + 1.0
+                and max(current_end, item.end_seconds)
+                - min(current_start, item.start_seconds)
+                <= 6.0
+            ):
+                clusters[-1].append(item)
+            else:
+                clusters.append([item])
+
+        local_times = np.asarray(
+            [item.beat_time_seconds for item in local_events], dtype=float
+        )
+        for cluster in clusters:
+            scale_switches = sum(
+                item.transition_type == "scale_switch" for item in cluster
+            )
+            bridge_steps = sum(
+                item.transition_type in {"phase_bridge", "bidirectional_bridge"}
+                for item in cluster
+            )
+            if len(cluster) < 3 or (scale_switches < 2 and bridge_steps < 3):
+                continue
+            cluster_start = min(item.start_seconds for item in cluster)
+            cluster_end = max(item.end_seconds for item in cluster)
+            if not 1.5 <= cluster_end - cluster_start <= 6.0:
+                continue
+            left = int(np.searchsorted(local_times, cluster_start, side="right") - 1)
+            nearest_left = int(np.argmin(np.abs(local_times - cluster_start)))
+            if abs(local_times[nearest_left] - cluster_start) <= 0.06:
+                left = nearest_left
+            right = int(np.searchsorted(local_times, cluster_end, side="left"))
+            left = max(0, left)
+            right = min(len(local_events) - 1, right)
+            while right < len(local_events) - 1 and unstable_event(local_events[right]):
+                right += 1
+            if left < 6 or right + 6 >= len(local_events) or right - left < 4:
+                continue
+            left_window = local_events[left - 6 : left + 1]
+            right_window = local_events[right : right + 7]
+            if any(unstable_event(item) for item in left_window + right_window):
+                continue
+            left_times = np.asarray(
+                [item.beat_time_seconds for item in left_window], dtype=float
+            )
+            right_times = np.asarray(
+                [item.beat_time_seconds for item in right_window], dtype=float
+            )
+            left_intervals = np.diff(left_times)
+            right_intervals = np.diff(right_times)
+            left_period = float(np.median(left_intervals))
+            right_period = float(np.median(right_intervals))
+            if (
+                _robust_stability(left_intervals) < 0.72
+                or _robust_stability(right_intervals) < 0.72
+                or abs(left_period - right_period)
+                / max(left_period, right_period)
+                > 0.06
+            ):
+                continue
+            left_support = sum(
+                max(item.beat_probability, item.downbeat_probability) >= 0.45
+                for item in left_window
+            )
+            right_support = sum(
+                max(item.beat_probability, item.downbeat_probability) >= 0.45
+                for item in right_window
+            )
+            # Half-time source detections may support only one side directly;
+            # the other side can still be a strong timing anchor when its
+            # intervals are highly stable. Require one acoustically anchored
+            # side and sufficient evidence across both windows.
+            if max(left_support, right_support) < 2 or left_support + right_support < 3:
+                continue
+            left_time = local_events[left].beat_time_seconds
+            right_time = local_events[right].beat_time_seconds
+            span = right_time - left_time
+            if not 1.5 <= span <= 6.0:
+                continue
+            reference_period = 0.5 * (left_period + right_period)
+            expected_intervals = int(round(span / reference_period))
+            current_intervals = right - left
+            if expected_intervals < 4 or abs(current_intervals - expected_intervals) != 1:
+                continue
+            corrected_period = span / expected_intervals
+            if not minimum_period <= corrected_period <= maximum_period:
+                continue
+            corrected_error = max(
+                abs(corrected_period - left_period) / left_period,
+                abs(corrected_period - right_period) / right_period,
+            )
+            current_period = span / current_intervals
+            current_error = max(
+                abs(current_period - left_period) / left_period,
+                abs(current_period - right_period) / right_period,
+            )
+            if corrected_error > 0.06 or current_error - corrected_error < 0.025:
+                continue
+            candidates.append(
+                (
+                    segment_indices[left],
+                    segment_indices[right],
+                    segment_id,
+                    expected_intervals,
+                    left_period,
+                    right_period,
+                    current_intervals,
+                    len(cluster),
+                )
+            )
+
+    occupied: list[tuple[int, int]] = []
+    for (
+        left,
+        right,
+        segment_id,
+        expected_intervals,
+        left_period,
+        right_period,
+        current_intervals,
+        evidence_count,
+    ) in sorted(candidates, reverse=True):
+        if any(not (right <= used_left or left >= used_right) for used_left, used_right in occupied):
+            continue
+        left_event = reconciled[left]
+        right_event = reconciled[right]
+        left_time = left_event.beat_time_seconds
+        right_time = right_event.beat_time_seconds
+        corrected_period = (right_time - left_time) / expected_intervals
+        old_middle = reconciled[left + 1 : right]
+        right_scale = right_event.selected_scale
+        scale_switch_time = right_time
+        if left_event.selected_scale != right_scale:
+            for index, item in enumerate(old_middle):
+                if item.selected_scale != right_scale:
+                    continue
+                suffix = old_middle[index:]
+                if all(value.selected_scale == right_scale for value in suffix):
+                    scale_switch_time = item.beat_time_seconds
+                    break
+        replacement: list[PhaseGridEvent] = []
+        projected_times: list[float] = []
+        for offset in range(1, expected_intervals):
+            projected_time = left_time + offset * corrected_period
+            projected_times.append(float(projected_time))
+            template = min(
+                old_middle or [left_event, right_event],
+                key=lambda item: abs(item.beat_time_seconds - projected_time),
+            )
+            beat_prob, downbeat_prob = probabilities(projected_time)
+            replacement.append(
+                PhaseGridEvent(
+                    grid_beat_index=template.grid_beat_index,
+                    activity_segment_id=segment_id,
+                    beat_time_seconds=float(projected_time),
+                    selected_scale=(
+                        right_scale
+                        if projected_time >= scale_switch_time
+                        else left_event.selected_scale
+                    ),
+                    target_period_seconds=float(corrected_period),
+                    predicted_time_seconds=float(projected_time),
+                    phase_residual_seconds=0.0,
+                    beat_probability=beat_prob,
+                    downbeat_probability=downbeat_prob,
+                    event_source="anchor_count_reconciled",
+                    transition_type="anchor_count_reconciled",
+                    path_cost=template.path_cost,
+                )
+            )
+        old_times = [item.beat_time_seconds for item in old_middle]
+        nearest_shifts = [
+            min(abs(old_time - projected_time) for projected_time in projected_times)
+            for old_time in old_times
+        ] + [
+            min(abs(projected_time - old_time) for old_time in old_times)
+            for projected_time in projected_times
+        ]
+        maximum_adjustment = max(nearest_shifts) if nearest_shifts else 0.0
+        reconciled[left + 1 : right] = replacement
+        reconciled_transitions = [
+            item
+            for item in reconciled_transitions
+            if not (
+                item.activity_segment_id == segment_id
+                and item.transition_type in suspect_types
+                and item.end_seconds > left_time
+                and item.start_seconds < right_time
+            )
+        ]
+        reconciled_transitions.append(
+            GridTransition(
+                transition_id=len(reconciled_transitions) + 1,
+                activity_segment_id=segment_id,
+                start_seconds=left_time,
+                end_seconds=right_time,
+                previous_scale=left_event.selected_scale,
+                next_scale=right_scale,
+                previous_period_seconds=left_period,
+                next_period_seconds=right_period,
+                phase_adjustment_seconds=float(maximum_adjustment),
+                transition_type="anchor_count_reconciled",
+                diagnostic_note=(
+                    "Stable anchor windows reconciled interval count "
+                    f"{current_intervals}->{expected_intervals}; "
+                    f"period={corrected_period:.6f}s; "
+                    f"max_shift={maximum_adjustment:.6f}s; "
+                    f"evidence={evidence_count}"
+                ),
+            )
+        )
+        occupied.append((left, right))
+
+    for grid_index, item in enumerate(reconciled, start=1):
+        item.grid_beat_index = grid_index
+    reconciled_transitions.sort(
+        key=lambda item: (item.activity_segment_id, item.start_seconds, item.end_seconds)
+    )
+    for transition_id, item in enumerate(reconciled_transitions, start=1):
+        item.transition_id = transition_id
+    return reconciled, reconciled_transitions
+
+
 def refine_phase_grid_bidirectionally(
     phase_result: BeatResult,
     events: list[PhaseGridEvent],
@@ -2083,6 +2367,11 @@ def refine_phase_grid_bidirectionally(
                 break
         rebuilt.extend(segment)
     refined = rebuilt
+    refined, refined_transitions = reconcile_anchor_beat_counts(
+        refined,
+        refined_transitions,
+        frames,
+    )
     for grid_index, item in enumerate(refined, start=1):
         item.grid_beat_index = grid_index
 
@@ -2121,7 +2410,8 @@ def refine_phase_grid_bidirectionally(
         beat_times=output_times,
         downbeat_times=output_downbeats,
         note=(
-            "P3-C bidirectional phase grid with future-confirmed backtracking"
+            "P3-C bidirectional phase grid with future-confirmed backtracking "
+            "and conservative stable-anchor beat-count reconciliation"
         ),
     )
     return result, refined, refined_transitions
@@ -2877,11 +3167,13 @@ def build_reliability_segments(
         "bidirectional_refined",
         "future_confirmed_backtrack",
         "future_phase_start",
+        "anchor_count_reconciled",
     }
     repair_transitions = {
         "bidirectional_bridge",
         "future_confirmed_backtrack",
         "future_phase_start",
+        "anchor_count_reconciled",
     }
     for activity_id, (range_start, range_end) in enumerate(active_ranges):
         local_events = [
@@ -2958,6 +3250,10 @@ def build_reliability_segments(
                 item.transition_type == "future_phase_start"
                 for item in local_transitions
             )
+            has_anchor_count_reconciliation = any(
+                item.transition_type == "anchor_count_reconciled"
+                for item in local_transitions
+            )
             local_diagnostics = [
                 item
                 for item in diagnostics
@@ -3012,6 +3308,7 @@ def build_reliability_segments(
                 evidence_unreliable
                 and not is_tempo_motion
                 and not has_future_phase_start
+                and not has_anchor_count_reconciliation
             )
             if unreliable:
                 classification = "BEAT_THIS_UNRELIABLE"
@@ -3929,6 +4226,7 @@ def write_phase_grid_comparison_plot(
             "scale_switch",
             "phase_bridge",
             "future_phase_start",
+            "anchor_count_reconciled",
         }:
             continue
         for ax in axes:
@@ -4132,6 +4430,7 @@ def write_p4_diagnostic_plot(
                 "bidirectional_refined",
                 "future_confirmed_backtrack",
                 "future_phase_start",
+                "anchor_count_reconciled",
             }
         ],
         dtype=float,
@@ -4145,6 +4444,7 @@ def write_p4_diagnostic_plot(
                 "bidirectional_refined",
                 "future_confirmed_backtrack",
                 "future_phase_start",
+                "anchor_count_reconciled",
             }
         ],
         dtype=float,
@@ -4774,6 +5074,10 @@ def analyse_file(
                 item.transition_type == "future_phase_start"
                 for item in grid_transitions
             ),
+            "anchor_count_reconciliations": sum(
+                item.transition_type == "anchor_count_reconciled"
+                for item in grid_transitions
+            ),
             "future_backtracked_beats": sum(
                 item.event_source == "future_confirmed_backtrack"
                 for item in phase_events
@@ -4808,6 +5112,8 @@ def analyse_file(
             ),
             "note": (
                 "P3-C4 uses phase-aware decoding as the only grid generator. "
+                "Compatible stable anchors may reconcile a local one-beat "
+                "count mismatch within a short transition. "
                 "A failed refined grid falls back to the validated greedy "
                 "phase path rather than legacy normalization."
             ),
