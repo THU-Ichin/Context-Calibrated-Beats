@@ -16,7 +16,7 @@ Those materials may have separate licenses and are not covered by this notice.
 
 ## Other dependencies
 
-The Python packages listed in `requirements-bpm.txt` are installed separately
+The Python packages listed in `requirements.txt` are installed separately
 and remain governed by their respective licenses. Distributors should retain
 the license and notice files supplied by those packages.
 

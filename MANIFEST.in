@@ -3,4 +3,4 @@ include INSTRUCTIONS.md
 include INSTRUCTIONS_CN.md
 include README_CN.md
 include THIRD_PARTY_NOTICES.md
-include requirements-bpm.txt
+include requirements.txt
