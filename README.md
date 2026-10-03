@@ -2,7 +2,7 @@
 
 *Automatic Beat Tracking, Calibration and Click Generation*
 
-**English** | [中文](README_CN.md)
+**English** | [简体中文](README_CN.md)
 
 CCB is an offline beat-grid tool. It uses
 [Beat This!](https://github.com/CPJKU/beat_this) to detect beats and downbeats,

@@ -2,7 +2,7 @@
 
 *Automatic Beat Tracking, Calibration and Click Generation*
 
-[English](README.md) | **中文**
+[English](README.md) | **简体中文**
 
 CCB 是一个离线音乐节拍网格工具。它使用
 [Beat This!](https://github.com/CPJKU/beat_this) 生成 beat/downbeat，再构建连续、
@@ -86,7 +86,7 @@ print(result.report["result"]["dominant_bpm"])
 `InvalidArgumentError`、`ResourceNotFoundError`、`ResultStateError`、
 `EditConflictError` 和 `ItemNotFoundError`。
 
-更完整的调用示例见 [中文使用说明](INSTRUCTIONS_CN.md)。
+更完整的调用示例见 [简体中文使用说明](INSTRUCTIONS_CN.md)。
 
 ## 输出结构
 

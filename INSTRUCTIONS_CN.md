@@ -1,6 +1,6 @@
 # CCB 使用说明
 
-[English](INSTRUCTIONS.md) | **中文** | [项目首页](README_CN.md)
+[English](INSTRUCTIONS.md) | **简体中文** | [项目首页](README_CN.md)
 
 CCB（Context Calibrated Beats）是一个离线音乐节拍网格工具。它使用 Beat This! 生成拍点和 downbeat，再将速度归一化到 `[120, 240)` BPM。
 
