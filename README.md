@@ -4,6 +4,9 @@
 
 **English** | [简体中文](README_CN.md)
 
+[![PyPI](https://img.shields.io/pypi/v/context-calibrated-beats.svg)](https://pypi.org/project/context-calibrated-beats/)
+[![Python](https://img.shields.io/pypi/pyversions/context-calibrated-beats.svg)](https://pypi.org/project/context-calibrated-beats/)
+
 CCB is an offline beat-grid tool. It uses
 [Beat This!](https://github.com/CPJKU/beat_this) to detect beats and downbeats,
 then builds a continuous, audible, and reviewable beat grid whose final tempo
@@ -27,7 +30,9 @@ artifacts. It can be used from the command line or through the
 
 ## Installation
 
-CCB supports Python 3.10–3.12. A virtual environment is recommended.
+CCB is published on
+[PyPI](https://pypi.org/project/context-calibrated-beats/) and supports Python
+3.10–3.12. Installing from PyPI in a virtual environment is recommended.
 
 Windows:
 
@@ -45,12 +50,20 @@ python3 -m venv .venv
 .venv/bin/python -m pip install context-calibrated-beats
 ```
 
-To install the current source checkout instead, replace the package name with
-`-e .` in the final command.
+Verify the installation:
+
+```console
+ccb --version
+```
+
+Upgrade an existing installation with
+`python -m pip install --upgrade context-calibrated-beats`. To install a source
+checkout for development instead, run `python -m pip install -e .` from the
+repository root.
 
 ## CLI
 
-After installation, use the `ccb` command:
+After installing from PyPI, use the `ccb` command from any directory:
 
 ```powershell
 ccb "D:\Music\song.mp3"

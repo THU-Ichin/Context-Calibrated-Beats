@@ -8,7 +8,7 @@ CCB（Context Calibrated Beats）是一个离线音乐节拍网格工具。它�
 
 ## 环境
 
-支持 Python 3.10–3.12，建议使用 Python 3.12 和虚拟环境。
+CCB 已发布至 [PyPI](https://pypi.org/project/context-calibrated-beats/)，支持 Python 3.10–3.12，建议使用 Python 3.12 并在虚拟环境中安装。
 
 Windows：
 
@@ -26,7 +26,13 @@ python3 -m venv .venv
 .venv/bin/python -m pip install context-calibrated-beats
 ```
 
-如需安装当前源码目录，请将最后一条命令中的包名替换为 `-e .`。
+安装后可确认命令行入口是否可用：
+
+```console
+ccb --version
+```
+
+已有安装可使用 `python -m pip install --upgrade context-calibrated-beats` 升级。如需安装源码用于开发，请在仓库根目录执行 `python -m pip install -e .`。
 
 ## 基本用法
 
@@ -76,7 +82,7 @@ ccb --help
 
 ## Python 函数接口
 
-其他 Python 程序可直接调用 `API.run()`，无需构造 CLI 命令：
+其他 Python 程序可直接调用公开函数接口，无需构造 CLI 命令：
 
 ```python
 from context_calibrated_beats import run, set_click_gain, set_music_gain

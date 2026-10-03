@@ -11,8 +11,9 @@ The application keeps one final result and does not emit historical `raw`,
 
 ## Environment
 
-CCB supports Python 3.10–3.12. Python 3.12 and a virtual environment are
-recommended.
+CCB is available from
+[PyPI](https://pypi.org/project/context-calibrated-beats/) and supports Python
+3.10–3.12. Python 3.12 and a virtual environment are recommended.
 
 Windows:
 
@@ -30,8 +31,16 @@ python3 -m venv .venv
 .venv/bin/python -m pip install context-calibrated-beats
 ```
 
-To install the current source checkout instead, replace the package name with
-`-e .` in the final command.
+Confirm that the command-line entry point is available:
+
+```console
+ccb --version
+```
+
+Upgrade an existing installation with
+`python -m pip install --upgrade context-calibrated-beats`. To install a source
+checkout for development, run `python -m pip install -e .` from the repository
+root.
 
 ## Basic usage
 
@@ -82,8 +91,8 @@ entry point.
 
 ## Python function API
 
-Other Python programs can call `API.run()` directly instead of constructing a
-CLI command:
+Other Python programs can call the public function API directly instead of
+constructing a CLI command:
 
 ```python
 from context_calibrated_beats import run, set_click_gain, set_music_gain

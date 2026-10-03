@@ -4,6 +4,9 @@
 
 [English](README.md) | **简体中文**
 
+[![PyPI](https://img.shields.io/pypi/v/context-calibrated-beats.svg)](https://pypi.org/project/context-calibrated-beats/)
+[![Python](https://img.shields.io/pypi/pyversions/context-calibrated-beats.svg)](https://pypi.org/project/context-calibrated-beats/)
+
 CCB 是一个离线音乐节拍网格工具。它使用
 [Beat This!](https://github.com/CPJKU/beat_this) 生成 beat/downbeat，再构建连续、可试听、可检查的节拍网格，并将最终速度归一化到 `[120, 240)` BPM。
 
@@ -20,7 +23,7 @@ CCB 只保留一套最终结果，不向用户输出各个历史处理阶段。�
 
 ## 安装
 
-需要 Python 3.10–3.12，建议使用虚拟环境。
+CCB 已发布至 [PyPI](https://pypi.org/project/context-calibrated-beats/)，支持 Python 3.10–3.12，建议在虚拟环境中从 PyPI 安装。
 
 Windows：
 
@@ -38,11 +41,17 @@ python3 -m venv .venv
 .venv/bin/python -m pip install context-calibrated-beats
 ```
 
-如需安装当前源码目录，请将最后一条命令中的包名替换为 `-e .`。
+安装后可验证版本：
+
+```console
+ccb --version
+```
+
+已有安装可使用 `python -m pip install --upgrade context-calibrated-beats` 升级。如需安装源码用于开发，请在仓库根目录执行 `python -m pip install -e .`。
 
 ## CLI
 
-安装后可使用 `ccb`：
+从 PyPI 安装后，可以在任意目录使用 `ccb`：
 
 ```powershell
 ccb "D:\Music\song.mp3"
