@@ -665,6 +665,80 @@ class CsvPipelineTest(unittest.TestCase):
             )
         )
 
+    def test_p3c_reconciles_a_4_5_4_downbeat_bar_pattern(self) -> None:
+        period = 0.34
+        downbeats = np.asarray([0.0, 1.36, 2.72, 4.08])
+        times = np.concatenate(
+            (
+                np.linspace(downbeats[0], downbeats[1], 5),
+                np.linspace(downbeats[1], downbeats[2], 6)[1:],
+                np.linspace(downbeats[2], downbeats[3], 5)[1:],
+            )
+        )
+        events = []
+        for index, time_seconds in enumerate(times):
+            in_bad_bar = downbeats[1] < time_seconds < downbeats[2]
+            is_downbeat = bool(np.any(np.isclose(time_seconds, downbeats)))
+            events.append(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=index + 1,
+                    activity_segment_id=0,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=1.0,
+                    target_period_seconds=period,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=0.95 if not in_bad_bar else 0.20,
+                    downbeat_probability=0.95 if is_downbeat else 0.0,
+                    event_source="phase_bridge" if in_bad_bar else "acoustic_peak",
+                    transition_type="phase_bridge" if in_bad_bar else "stable",
+                    path_cost=float(index),
+                )
+            )
+        transitions = [
+            bpm.GridTransition(
+                transition_id=index + 1,
+                activity_segment_id=0,
+                start_seconds=float(start),
+                end_seconds=float(end),
+                previous_scale=1.0,
+                next_scale=1.0,
+                previous_period_seconds=period,
+                next_period_seconds=period * 0.8,
+                phase_adjustment_seconds=0.04,
+                transition_type="phase_bridge",
+                diagnostic_note="synthetic five-beat middle bar",
+            )
+            for index, (start, end) in enumerate(
+                ((1.36, 1.85), (1.85, 2.25), (2.25, 2.72))
+            )
+        ]
+
+        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+            events,
+            transitions,
+            self.frames,
+        )
+        repaired_times = np.asarray(
+            [item.beat_time_seconds for item in repaired], dtype=float
+        )
+        left = int(np.flatnonzero(np.isclose(repaired_times, downbeats[1]))[0])
+        right = int(np.flatnonzero(np.isclose(repaired_times, downbeats[2]))[0])
+
+        self.assertEqual(right - left, 4)
+        np.testing.assert_allclose(
+            np.diff(repaired_times[left : right + 1]),
+            period,
+            atol=1e-9,
+        )
+        self.assertTrue(
+            any(
+                item.transition_type == "anchor_count_reconciled"
+                and "source=downbeat_bars" in item.diagnostic_note
+                for item in repaired_transitions
+            )
+        )
+
     def test_p4_marks_scale_churn_as_unreliable_without_changing_beats(self) -> None:
         times = np.arange(0.0, 12.01, 0.30)
         events = [

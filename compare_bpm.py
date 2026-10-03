@@ -1592,14 +1592,16 @@ def reconcile_anchor_beat_counts(
             in {"phase_bridge", "scale_switch", "bidirectional_bridge"}
         )
 
-    candidates: list[tuple[int, int, int, int, float, float, int, int]] = []
+    candidates: list[
+        tuple[int, int, int, int, float, float, int, int, str]
+    ] = []
     for segment_id in sorted({item.activity_segment_id for item in reconciled}):
         segment_indices = [
             index
             for index, item in enumerate(reconciled)
             if item.activity_segment_id == segment_id
         ]
-        if len(segment_indices) < 16:
+        if len(segment_indices) < 12:
             continue
         local_events = [reconciled[index] for index in segment_indices]
         local_transitions = sorted(
@@ -1732,6 +1734,102 @@ def reconcile_anchor_beat_counts(
                     right_period,
                     current_intervals,
                     len(cluster),
+                    "stable_windows",
+                )
+            )
+
+        # A locally unstable passage may not provide the six clean events
+        # required above, while its bar structure is still unambiguous. Four
+        # strong consecutive downbeats provide three adjacent bar spans; only
+        # reconcile the middle bar when the outer bars agree on both duration
+        # and beat count and the middle differs by exactly one beat.
+        downbeat_positions = [
+            index
+            for index, item in enumerate(local_events)
+            if item.downbeat_probability >= 0.75
+            and item.beat_probability >= 0.45
+        ]
+        for anchor_offset in range(len(downbeat_positions) - 3):
+            anchor_positions = downbeat_positions[anchor_offset : anchor_offset + 4]
+            anchor_times = np.asarray(
+                [local_events[index].beat_time_seconds for index in anchor_positions],
+                dtype=float,
+            )
+            bar_spans = np.diff(anchor_times)
+            median_span = float(np.median(bar_spans))
+            if (
+                median_span <= 0
+                or float(np.max(np.abs(bar_spans - median_span)))
+                / median_span
+                > 0.06
+            ):
+                continue
+            bar_counts = np.diff(np.asarray(anchor_positions, dtype=int))
+            expected_intervals = int(bar_counts[0])
+            current_intervals = int(bar_counts[1])
+            if (
+                expected_intervals != int(bar_counts[2])
+                or not 2 <= expected_intervals <= 8
+                or abs(current_intervals - expected_intervals) != 1
+            ):
+                continue
+            left_period = float(bar_spans[0] / expected_intervals)
+            right_period = float(bar_spans[2] / expected_intervals)
+            corrected_period = float(bar_spans[1] / expected_intervals)
+            current_period = float(bar_spans[1] / current_intervals)
+            if (
+                not minimum_period <= corrected_period <= maximum_period
+                or abs(left_period - right_period)
+                / max(left_period, right_period)
+                > 0.06
+                or max(
+                    abs(corrected_period - left_period) / left_period,
+                    abs(corrected_period - right_period) / right_period,
+                )
+                > 0.06
+            ):
+                continue
+            corrected_error = max(
+                abs(corrected_period - left_period) / left_period,
+                abs(corrected_period - right_period) / right_period,
+            )
+            current_error = max(
+                abs(current_period - left_period) / left_period,
+                abs(current_period - right_period) / right_period,
+            )
+            if current_error - corrected_error < 0.025:
+                continue
+            left = int(anchor_positions[1])
+            right = int(anchor_positions[2])
+            middle_events = local_events[left + 1 : right]
+            middle_transitions = [
+                item
+                for item in local_transitions
+                if item.end_seconds > anchor_times[1]
+                and item.start_seconds < anchor_times[2]
+            ]
+            unstable_count = sum(unstable_event(item) for item in middle_events)
+            low_support_count = sum(
+                max(item.beat_probability, item.downbeat_probability) < 0.45
+                for item in middle_events
+            )
+            if (
+                unstable_count < 2
+                and low_support_count < 2
+                and len(middle_transitions) < 2
+            ):
+                continue
+            candidates.append(
+                (
+                    segment_indices[left],
+                    segment_indices[right],
+                    segment_id,
+                    expected_intervals,
+                    left_period,
+                    right_period,
+                    current_intervals,
+                    unstable_count + low_support_count + len(middle_transitions),
+                    "downbeat_bars",
                 )
             )
 
@@ -1745,6 +1843,7 @@ def reconcile_anchor_beat_counts(
         right_period,
         current_intervals,
         evidence_count,
+        evidence_source,
     ) in sorted(candidates, reverse=True):
         if any(not (right <= used_left or left >= used_right) for used_left, used_right in occupied):
             continue
@@ -1810,8 +1909,9 @@ def reconcile_anchor_beat_counts(
             if not (
                 item.activity_segment_id == segment_id
                 and item.transition_type in suspect_types
-                and item.end_seconds > left_time
-                and item.start_seconds < right_time
+                and left_time
+                <= 0.5 * (item.start_seconds + item.end_seconds)
+                <= right_time
             )
         ]
         reconciled_transitions.append(
@@ -1831,7 +1931,7 @@ def reconcile_anchor_beat_counts(
                     f"{current_intervals}->{expected_intervals}; "
                     f"period={corrected_period:.6f}s; "
                     f"max_shift={maximum_adjustment:.6f}s; "
-                    f"evidence={evidence_count}"
+                    f"evidence={evidence_count}; source={evidence_source}"
                 ),
             )
         )
@@ -5076,6 +5176,16 @@ def analyse_file(
             ),
             "anchor_count_reconciliations": sum(
                 item.transition_type == "anchor_count_reconciled"
+                for item in grid_transitions
+            ),
+            "stable_window_count_reconciliations": sum(
+                item.transition_type == "anchor_count_reconciled"
+                and "source=stable_windows" in item.diagnostic_note
+                for item in grid_transitions
+            ),
+            "downbeat_bar_count_reconciliations": sum(
+                item.transition_type == "anchor_count_reconciled"
+                and "source=downbeat_bars" in item.diagnostic_note
                 for item in grid_transitions
             ),
             "future_backtracked_beats": sum(
