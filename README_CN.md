@@ -5,8 +5,7 @@
 [English](README.md) | **简体中文**
 
 CCB 是一个离线音乐节拍网格工具。它使用
-[Beat This!](https://github.com/CPJKU/beat_this) 生成 beat/downbeat，再构建连续、
-可试听、可检查的节拍网格，并将最终速度归一化到 `[120, 240)` BPM。
+[Beat This!](https://github.com/CPJKU/beat_this) 生成 beat/downbeat，再构建连续、可试听、可检查的节拍网格，并将最终速度归一化到 `[120, 240)` BPM。
 
 CCB 只保留一套最终结果，不向用户输出各个历史处理阶段。它既可以作为命令行工具使用，也可以通过 `context_calibrated_beats` Python API 调用。
 
@@ -76,8 +75,7 @@ print(result.report["result"]["dominant_bpm"])
 ```
 
 `run()` 每次处理一首歌。默认复用有效缓存并保留人工节拍编辑；使用
-`refresh_cache=True` 可强制重新推理，使用 `preserve_manual_edits=False` 可输出纯
-自动网格。
+`refresh_cache=True` 可强制重新推理，使用 `preserve_manual_edits=False` 可输出纯自动网格。
 
 ### 公开函数
 
@@ -133,7 +131,6 @@ python -m unittest discover -s tests
 ## 许可
 
 CCB 由 Ichin 以 [MIT License](LICENSE) 发布。Beat This! 及其他依赖保留各自许可；
-详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。用户应确保自己有权处理输入
-音频。
+详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。用户应确保自己有权处理输入音频。
 
 版本变化记录见 [CHANGELOG.md](CHANGELOG.md)。
