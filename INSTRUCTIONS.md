@@ -6,8 +6,7 @@ CCB (Context Calibrated Beats) is an offline beat-grid tool. It uses Beat This!
 to detect beats and downbeats, then normalizes the tempo to the `[120, 240)` BPM
 range.
 
-The application keeps one final result and does not emit historical `raw`,
-`fused`, or `repaired` stage files.
+The application keeps one final result and does not emit historical stage files.
 
 ## Environment
 
