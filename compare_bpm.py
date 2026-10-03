@@ -1152,6 +1152,92 @@ def _frame_index(time_seconds: float, frames: FramePredictions) -> int:
     )
 
 
+def _collapse_repeated_close_doublets(
+    segment_times: np.ndarray,
+    probabilities,
+) -> tuple[np.ndarray, list[tuple[float, float, int]]]:
+    """Collapse sustained 80-ms-style duplicate pairs before grid decoding.
+
+    A single close pair can be a legitimate transient or an ornament, so it is
+    never enough to alter the source used by the grid. This gate only accepts
+    at least four consecutive pairs whose pair-to-pair spacing is a stable
+    0.70--0.90 seconds. That is the characteristic half-time/double-peak
+    topology seen in Aria, while ordinary dense passages and isolated doublets
+    remain untouched. Raw/fused inference CSVs are not modified.
+    """
+    times = np.asarray(segment_times, dtype=float)
+    if len(times) < 8:
+        return times, []
+
+    pairs: list[tuple[int, int]] = []
+    index = 0
+    while index + 1 < len(times):
+        gap = float(times[index + 1] - times[index])
+        left_support = max(probabilities(float(times[index])))
+        right_support = max(probabilities(float(times[index + 1])))
+        if 0.04 <= gap <= 0.12 and max(left_support, right_support) >= 0.45:
+            pairs.append((index, index + 1))
+            index += 2
+        else:
+            index += 1
+
+    runs: list[list[tuple[int, int]]] = []
+    for pair in pairs:
+        if not runs:
+            runs.append([pair])
+            continue
+        previous = runs[-1][-1]
+        start_spacing = float(times[pair[0]] - times[previous[0]])
+        consecutive = pair[0] == previous[1] + 1
+        if consecutive and 0.70 <= start_spacing <= 0.90:
+            runs[-1].append(pair)
+        else:
+            runs.append([pair])
+
+    drop_indices: set[int] = set()
+    collapsed_runs: list[tuple[float, float, int]] = []
+    for run in runs:
+        if len(run) < 4:
+            continue
+        starts = np.asarray([times[left] for left, _ in run], dtype=float)
+        spacings = np.diff(starts)
+        median_spacing = float(np.median(spacings))
+        if (
+            median_spacing <= 0
+            or float(np.max(np.abs(spacings - median_spacing)))
+            / median_spacing
+            > 0.06
+        ):
+            continue
+
+        left_scores: list[float] = []
+        right_scores: list[float] = []
+        for left, right in run:
+            left_beat, left_downbeat = probabilities(float(times[left]))
+            right_beat, right_downbeat = probabilities(float(times[right]))
+            left_scores.append(left_beat + 0.35 * left_downbeat)
+            right_scores.append(right_beat + 0.35 * right_downbeat)
+        if float(np.mean(np.maximum(left_scores, right_scores))) < 0.55:
+            continue
+
+        keep_right = float(np.mean(right_scores)) > float(np.mean(left_scores))
+        for left, right in run:
+            drop_indices.add(left if keep_right else right)
+        collapsed_runs.append(
+            (
+                float(times[run[0][0]]),
+                float(times[run[-1][1]]),
+                len(run),
+            )
+        )
+
+    if not drop_indices:
+        return times, []
+    keep_mask = np.ones(len(times), dtype=bool)
+    keep_mask[list(drop_indices)] = False
+    return times[keep_mask], collapsed_runs
+
+
 def _future_aligned_segment_start(
     segment_times: np.ndarray,
     period_at,
@@ -1293,6 +1379,12 @@ def build_phase_aware_grid(
         segment_times = source_times[mask]
         if len(segment_times) < 2:
             continue
+        segment_times, collapsed_doublet_runs = _collapse_repeated_close_doublets(
+            segment_times,
+            probabilities,
+        )
+        if len(segment_times) < 2:
+            continue
         midpoints, _, base_bpm = local_tempo(segment_times)
         states, _ = decode_grid_scales(base_bpm)
         scales = GRID_SCALES[states]
@@ -1324,6 +1416,26 @@ def build_phase_aware_grid(
                     target_periods,
                     left=target_periods[0],
                     right=target_periods[-1],
+                )
+            )
+
+        for run_start, run_end, pair_count in collapsed_doublet_runs:
+            transitions.append(
+                GridTransition(
+                    transition_id=len(transitions) + 1,
+                    activity_segment_id=segment_id,
+                    start_seconds=run_start,
+                    end_seconds=run_end,
+                    previous_scale=scale_at(run_start),
+                    next_scale=scale_at(run_end),
+                    previous_period_seconds=period_at(run_start),
+                    next_period_seconds=period_at(run_end),
+                    phase_adjustment_seconds=0.0,
+                    transition_type="source_doublet_disambiguation",
+                    diagnostic_note=(
+                        f"Collapsed {pair_count} consecutive close source pairs "
+                        "before phase-grid decoding"
+                    ),
                 )
             )
 
@@ -1585,6 +1697,59 @@ def reconcile_anchor_beat_counts(
         index = _frame_index(time_seconds, frames)
         return float(beat_probability[index]), float(downbeat_probability[index])
 
+    def downbeat_anchor_evidence(
+        item: PhaseGridEvent,
+    ) -> tuple[float, float, float]:
+        """Return the strongest nearby joint beat/downbeat evidence.
+
+        Phase bridges can land on the shoulder of a broad downbeat peak. Use
+        the nearby frame maximum to qualify and time a bar anchor, while still
+        keeping the phase-grid event itself fixed unless count reconciliation
+        is independently proven safe.
+        """
+        phase_adjusted = (
+            item.event_source in {"phase_bridge", "bidirectional_refined"}
+            or item.transition_type
+            in {"phase_bridge", "scale_switch", "bidirectional_bridge"}
+        )
+        if (
+            not phase_adjusted
+            and item.downbeat_probability >= 0.75
+            and item.beat_probability >= 0.45
+        ):
+            return (
+                item.beat_time_seconds,
+                item.beat_probability,
+                item.downbeat_probability,
+            )
+        if item.downbeat_probability < 0.45:
+            return (
+                item.beat_time_seconds,
+                item.beat_probability,
+                item.downbeat_probability,
+            )
+
+        radius_frames = max(1, int(math.ceil(0.12 * frames.fps)))
+        center = _frame_index(item.beat_time_seconds, frames)
+        start = max(0, center - radius_frames)
+        end = min(len(beat_probability), center + radius_frames + 1)
+        local_beat = beat_probability[start:end]
+        local_downbeat = downbeat_probability[start:end]
+        eligible = np.flatnonzero(local_beat >= 0.45)
+        if len(eligible):
+            local_index = int(eligible[np.argmax(local_downbeat[eligible])])
+            frame_index = start + local_index
+            nearby_time = float(frame_index / frames.fps)
+            nearby_beat = float(beat_probability[frame_index])
+            nearby_downbeat = float(downbeat_probability[frame_index])
+            if nearby_downbeat > item.downbeat_probability:
+                return nearby_time, nearby_beat, nearby_downbeat
+        return (
+            item.beat_time_seconds,
+            item.beat_probability,
+            item.downbeat_probability,
+        )
+
     def unstable_event(item: PhaseGridEvent) -> bool:
         return (
             item.event_source in {"phase_bridge", "bidirectional_refined"}
@@ -1743,16 +1908,18 @@ def reconcile_anchor_beat_counts(
         # strong consecutive downbeats provide three adjacent bar spans; only
         # reconcile the middle bar when the outer bars agree on both duration
         # and beat count and the middle differs by exactly one beat.
+        downbeat_evidence = [downbeat_anchor_evidence(item) for item in local_events]
         downbeat_positions = [
             index
-            for index, item in enumerate(local_events)
-            if item.downbeat_probability >= 0.75
-            and item.beat_probability >= 0.45
+            for index, (_, beat_support, downbeat_support) in enumerate(
+                downbeat_evidence
+            )
+            if downbeat_support >= 0.75 and beat_support >= 0.45
         ]
         for anchor_offset in range(len(downbeat_positions) - 3):
             anchor_positions = downbeat_positions[anchor_offset : anchor_offset + 4]
             anchor_times = np.asarray(
-                [local_events[index].beat_time_seconds for index in anchor_positions],
+                [downbeat_evidence[index][0] for index in anchor_positions],
                 dtype=float,
             )
             bar_spans = np.diff(anchor_times)

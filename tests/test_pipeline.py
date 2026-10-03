@@ -739,6 +739,117 @@ class CsvPipelineTest(unittest.TestCase):
             )
         )
 
+    def test_p3c_collapses_only_a_sustained_close_doublet_run(self) -> None:
+        sustained = np.asarray(
+            [2.00, 2.08, 2.80, 2.88, 3.60, 3.68, 4.40, 4.48]
+        )
+        isolated = np.asarray([0.00, 0.08, 0.50, 1.00])
+        times = np.concatenate((isolated, sustained))
+
+        def probabilities(time_seconds: float) -> tuple[float, float]:
+            is_right_peak = any(
+                np.isclose(time_seconds, value)
+                for value in (0.08, 2.08, 2.88, 3.68, 4.48)
+            )
+            return (0.90 if is_right_peak else 0.60, 0.0)
+
+        collapsed, runs = bpm._collapse_repeated_close_doublets(
+            times,
+            probabilities,
+        )
+
+        np.testing.assert_allclose(
+            collapsed,
+            np.asarray([0.00, 0.08, 0.50, 1.00, 2.08, 2.88, 3.68, 4.48]),
+        )
+        self.assertEqual(runs, [(2.0, 4.48, 4)])
+
+    def test_p3c_downbeat_bar_uses_nearby_original_peak_evidence(self) -> None:
+        downbeats = np.asarray([0.00, 1.56, 3.10, 4.62])
+        times = np.concatenate(
+            (
+                np.linspace(downbeats[0], downbeats[1], 5),
+                np.linspace(downbeats[1], downbeats[2], 6)[1:],
+                np.linspace(downbeats[2], downbeats[3], 5)[1:],
+            )
+        )
+        frame_count = 300
+        beat_logits = np.full(frame_count, -6.0)
+        downbeat_logits = np.full(frame_count, -6.0)
+        evidence_times = np.asarray([0.00, 1.60, 3.16, 4.70])
+        for time_seconds in evidence_times:
+            index = min(round(time_seconds * self.fps), frame_count - 1)
+            beat_logits[index] = 6.0
+            downbeat_logits[index] = 6.0
+        frames = bpm.FramePredictions(
+            fps=self.fps,
+            raw_beat_logits=beat_logits.copy(),
+            raw_downbeat_logits=downbeat_logits.copy(),
+            fused_beat_logits=beat_logits.copy(),
+            fused_downbeat_logits=downbeat_logits.copy(),
+            window_seconds=30.0,
+            hop_seconds=10.0,
+            overlap_windows=1,
+        )
+        events = []
+        for index, time_seconds in enumerate(times):
+            is_downbeat = bool(np.any(np.isclose(time_seconds, downbeats)))
+            in_bad_bar = downbeats[1] < time_seconds < downbeats[2]
+            events.append(
+                bpm.PhaseGridEvent(
+                    grid_beat_index=index + 1,
+                    activity_segment_id=0,
+                    beat_time_seconds=float(time_seconds),
+                    selected_scale=1.0,
+                    target_period_seconds=0.39,
+                    predicted_time_seconds=float(time_seconds),
+                    phase_residual_seconds=0.0,
+                    beat_probability=0.60 if is_downbeat else 0.20,
+                    downbeat_probability=0.60 if is_downbeat else 0.0,
+                    event_source="phase_bridge" if in_bad_bar else "acoustic_peak",
+                    transition_type="phase_bridge" if in_bad_bar else "stable",
+                    path_cost=float(index),
+                )
+            )
+        transitions = [
+            bpm.GridTransition(
+                transition_id=index + 1,
+                activity_segment_id=0,
+                start_seconds=float(start),
+                end_seconds=float(end),
+                previous_scale=1.0,
+                next_scale=2.0,
+                previous_period_seconds=0.39,
+                next_period_seconds=0.30,
+                phase_adjustment_seconds=0.05,
+                transition_type="phase_bridge",
+                diagnostic_note="synthetic shifted downbeat evidence",
+            )
+            for index, (start, end) in enumerate(
+                ((1.56, 2.00), (2.00, 2.50), (2.50, 3.10))
+            )
+        ]
+
+        repaired, repaired_transitions = bpm.reconcile_anchor_beat_counts(
+            events,
+            transitions,
+            frames,
+        )
+        repaired_times = np.asarray(
+            [item.beat_time_seconds for item in repaired], dtype=float
+        )
+        left = int(np.flatnonzero(np.isclose(repaired_times, downbeats[1]))[0])
+        right = int(np.flatnonzero(np.isclose(repaired_times, downbeats[2]))[0])
+
+        self.assertEqual(right - left, 4)
+        self.assertTrue(
+            any(
+                item.transition_type == "anchor_count_reconciled"
+                and "source=downbeat_bars" in item.diagnostic_note
+                for item in repaired_transitions
+            )
+        )
+
     def test_p4_marks_scale_churn_as_unreliable_without_changing_beats(self) -> None:
         times = np.arange(0.0, 12.01, 0.30)
         events = [
